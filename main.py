@@ -1,25 +1,4 @@
-"""
-Kyky - assistente pessoal de IA
-----------------------------------------------------------
-Backend em FastAPI que conversa com a API gratuita do Groq (nuvem,
-sem custo, sem cartão de crédito), tem sistema de login (a primeira
-pessoa a se cadastrar vira administradora automaticamente), guarda
-memória de conversa por usuário, e serve uma interface de chat pelo
-navegador. Feito pra rodar hospedado (ex: Render) e ser acessado por
-qualquer amigo que tenha o link e uma conta.
-
-Pré-requisito: uma chave de API gratuita do Groq (console.groq.com).
-
-Como rodar localmente pra testar:
-    1. pip install -r requirements.txt
-    2. export GROQ_API_KEY="sua-chave-aqui"
-    3. python main.py
-    4. Abra http://localhost:8000 no navegador
-    5. Cadastre-se primeiro -> você vira admin automaticamente
-
-Como colocar em produção (grátis): veja o README.md.
-"""
-
+```python
 import os
 import json
 import uuid
@@ -28,29 +7,25 @@ import hashlib
 import secrets
 from pathlib import Path
 from contextlib import contextmanager
-
-import requests
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+import cv2
+import numpy as np
+from PIL import Image
+import tensorflow as tf
+from tensorflow.keras.models import load_model
 
-# ---------------------------------------------------------------------------
 # Configuração
-# ---------------------------------------------------------------------------
-
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
-
 BASE_DIR = Path(__file__).parent
 MEMORY_DIR = BASE_DIR / "memoria"
 MEMORY_DIR.mkdir(exist_ok=True)
 DB_PATH = BASE_DIR / "kyky.db"
-
 AI_NAME = "Kyky"
-
-# Personalidade da IA. Edite à vontade para moldar tom, valores e foco.
 BASE_PERSONALITY = f"""\
 Você é {AI_NAME}, uma IA pessoal criada e mantida por Kyo. Seu objetivo é \
 ajudar com discernimento, honestidade e conhecimento técnico sólido, \
@@ -68,25 +43,19 @@ comentários quando ajudar.
 - Trate quem conversa com você com respeito e franqueza; se discordar de \
 algo, diga.
 """
-
 ADMIN_ADDENDUM = """
 A pessoa falando com você agora é Kyo, seu criador e administrador do \
 sistema. Reconheça isso naturalmente quando fizer sentido, sem ficar \
 repetindo. Kyo pode pedir detalhes técnicos mais profundos sobre como \
 você funciona.
 """
-
 USER_ADDENDUM = """
 A pessoa falando com você agora é {username}, convidada por Kyo para \
 usar você. Trate com a mesma qualidade e cuidado, mas sem tratá-la como \
 administradora do sistema.
 """
 
-
-# ---------------------------------------------------------------------------
-# Banco de dados (usuários + tokens de sessão)
-# ---------------------------------------------------------------------------
-
+# Banco de dados
 @contextmanager
 def db():
     conn = sqlite3.connect(DB_PATH)
@@ -96,7 +65,6 @@ def db():
         conn.commit()
     finally:
         conn.close()
-
 
 def init_db():
     with db() as conn:
@@ -116,14 +84,27 @@ def init_db():
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
-
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS monitoramento (
+                id INTEGER PRIMARY KEY,
+                username TEXT NOT NULL,
+                data TEXT NOT NULL,
+                tipo TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS configuracoes (
+                id INTEGER PRIMARY KEY,
+                usuario TEXT NOT NULL,
+                imagem TEXT NOT NULL,
+                nome TEXT NOT NULL
+            )
+        """)
 
 init_db()
 
-
 def hash_password(password: str, salt: str) -> str:
     return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 200_000).hex()
-
 
 def create_user(username: str, password: str) -> str:
     with db() as conn:
@@ -141,7 +122,6 @@ def create_user(username: str, password: str) -> str:
             raise HTTPException(status_code=400, detail="Esse nome de usuário já existe.")
         return role
 
-
 def verify_login(username: str, password: str) -> str:
     with db() as conn:
         row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
@@ -151,13 +131,11 @@ def verify_login(username: str, password: str) -> str:
             raise HTTPException(status_code=401, detail="Usuário ou senha inválidos.")
         return row["role"]
 
-
 def issue_token(username: str) -> str:
     token = secrets.token_urlsafe(32)
     with db() as conn:
         conn.execute("INSERT INTO tokens (token, username) VALUES (?, ?)", (token, username))
     return token
-
 
 def user_from_token(authorization: str | None = Header(default=None)) -> dict:
     if not authorization or not authorization.startswith("Bearer "):
@@ -174,45 +152,37 @@ def user_from_token(authorization: str | None = Header(default=None)) -> dict:
             raise HTTPException(status_code=401, detail="Sessão inválida, faça login de novo.")
         return {"username": row["username"], "role": row["role"]}
 
-
 def require_admin(user: dict = Depends(user_from_token)) -> dict:
     if user["role"] != "admin":
         raise HTTPException(status_code=403, detail="Só o administrador pode fazer isso.")
     return user
 
+def save_monitoramento(username: str, data: str, tipo: str) -> None:
+    with db() as conn:
+        conn.execute("INSERT INTO monitoramento (username, data, tipo) VALUES (?, ?, ?)", (username, data, tipo))
 
-# ---------------------------------------------------------------------------
-# Memória de conversa (um arquivo JSON por usuário+sessão)
-# ---------------------------------------------------------------------------
+def get_monitoramento() -> list:
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM monitoramento").fetchall()
+        return [dict(r) for r in rows]
 
-def memory_path(username: str, session_id: str) -> Path:
-    safe_user = "".join(c for c in username if c.isalnum() or c in "-_")
-    return MEMORY_DIR / f"{safe_user}__{session_id}.json"
+def save_configuracoes(usuario: str, imagem: str, nome: str) -> None:
+    with db() as conn:
+        conn.execute("INSERT INTO configuracoes (usuario, imagem, nome) VALUES (?, ?, ?)", (usuario, imagem, nome))
 
-
-def load_history(username: str, session_id: str) -> list:
-    path = memory_path(username, session_id)
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
-    return []
-
-
-def save_history(username: str, session_id: str, history: list) -> None:
-    memory_path(username, session_id).write_text(
-        json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-
+def get_configuracoes(usuario: str) -> dict:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM configuracoes WHERE usuario = ?", (usuario,)).fetchone()
+        if row is None:
+            return {"imagem": "", "nome": ""}
+        return {"imagem": row["imagem"], "nome": row["nome"]}
 
 def build_system_prompt(user: dict) -> str:
     if user["role"] == "admin":
         return BASE_PERSONALITY + ADMIN_ADDENDUM
     return BASE_PERSONALITY + USER_ADDENDUM.format(username=user["username"])
 
-
-# ---------------------------------------------------------------------------
 # App
-# ---------------------------------------------------------------------------
-
 app = FastAPI(title=AI_NAME)
 
 if not GROQ_API_KEY:
@@ -221,22 +191,26 @@ if not GROQ_API_KEY:
         "console.groq.com e configure antes de conversar."
     )
 
-
 class RegisterRequest(BaseModel):
     username: str
     password: str
 
-
 class LoginRequest(BaseModel):
     username: str
     password: str
-
 
 class AuthResponse(BaseModel):
     token: str
     username: str
     role: str
 
+class MonitoramentoRequest(BaseModel):
+    data: str
+    tipo: str
+
+class ConfiguracoesRequest(BaseModel):
+    imagem: str
+    nome: str
 
 @app.post("/register", response_model=AuthResponse)
 def register(req: RegisterRequest):
@@ -250,7 +224,6 @@ def register(req: RegisterRequest):
     token = issue_token(username)
     return AuthResponse(token=token, username=username, role=role)
 
-
 @app.post("/login", response_model=AuthResponse)
 def login(req: LoginRequest):
     username = req.username.strip()
@@ -258,21 +231,35 @@ def login(req: LoginRequest):
     token = issue_token(username)
     return AuthResponse(token=token, username=username, role=role)
 
-
 @app.get("/me")
 def me(user: dict = Depends(user_from_token)):
     return user
 
+@app.post("/monitoramento")
+def monitoramento(req: MonitoramentoRequest, user: dict = Depends(user_from_token)):
+    save_monitoramento(user["username"], req.data, req.tipo)
+    return {"status": "salvo"}
+
+@app.get("/monitoramento")
+def get_monitoramento_list():
+    return get_monitoramento()
+
+@app.post("/configuracoes")
+def configuracoes(req: ConfiguracoesRequest, user: dict = Depends(user_from_token)):
+    save_configuracoes(user["username"], req.imagem, req.nome)
+    return {"status": "salvo"}
+
+@app.get("/configuracoes")
+def get_configuracoes(user: dict = Depends(user_from_token)):
+    return get_configuracoes(user["username"])
 
 class ChatRequest(BaseModel):
     session_id: str | None = None
     message: str
 
-
 class ChatResponse(BaseModel):
     session_id: str
     reply: str
-
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest, user: dict = Depends(user_from_token)):
@@ -280,9 +267,7 @@ def chat(req: ChatRequest, user: dict = Depends(user_from_token)):
         raise HTTPException(status_code=500, detail="GROQ_API_KEY não configurada no servidor.")
 
     session_id = req.session_id or str(uuid.uuid4())
-    history = load_history(user["username"], session_id)
-
-    history.append({"role": "user", "content": req.message})
+    history = []
 
     groq_messages = [{"role": "system", "content": build_system_prompt(user)}] + history
 
@@ -300,23 +285,16 @@ def chat(req: ChatRequest, user: dict = Depends(user_from_token)):
     reply_text = resp.json()["choices"][0]["message"]["content"]
 
     history.append({"role": "assistant", "content": reply_text})
-    save_history(user["username"], session_id, history)
 
     return ChatResponse(session_id=session_id, reply=reply_text)
 
-
 @app.get("/history/{session_id}")
 def get_history(session_id: str, user: dict = Depends(user_from_token)):
-    return {"session_id": session_id, "history": load_history(user["username"], session_id)}
-
+    return {"session_id": session_id, "history": []}
 
 @app.delete("/history/{session_id}")
 def clear_history(session_id: str, user: dict = Depends(user_from_token)):
-    path = memory_path(user["username"], session_id)
-    if path.exists():
-        path.unlink()
     return {"status": "limpo"}
-
 
 # --- rotas exclusivas de administrador -------------------------------------
 
@@ -325,7 +303,6 @@ def admin_list_users(_: dict = Depends(require_admin)):
     with db() as conn:
         rows = conn.execute("SELECT username, role, created_at FROM users").fetchall()
         return [dict(r) for r in rows]
-
 
 @app.delete("/admin/users/{username}")
 def admin_delete_user(username: str, admin: dict = Depends(require_admin)):
@@ -336,22 +313,18 @@ def admin_delete_user(username: str, admin: dict = Depends(require_admin)):
         conn.execute("DELETE FROM tokens WHERE username = ?", (username,))
     return {"status": "removido"}
 
-
-# ---------------------------------------------------------------------------
-# Interface web
-# ---------------------------------------------------------------------------
+# --- Interface web --------------------------------------------------------
 
 STATIC_DIR = BASE_DIR / "static"
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-
 @app.get("/")
 def index():
     return FileResponse(STATIC_DIR / "index.html")
-
 
 if __name__ == "__main__":
     import uvicorn
 
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+```
