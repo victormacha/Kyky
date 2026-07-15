@@ -1,6 +1,10 @@
-__pycache__/
-*.pyc
-venv/
-*.db
-memoria/
-.env
+fastapi
+uvicorn
+sqlite3
+requests
+pydantic
+python-multipart
+opencv-python
+pillow
+tensorflow
+numpy
