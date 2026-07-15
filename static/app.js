@@ -280,7 +280,8 @@ function clearChatView() {
 $('#menuToggle').addEventListener('click', () => $('#sidebar').classList.toggle('open'));
 function closeSidebarMobile() {
   if (window.innerWidth <= 760) $('#sidebar').classList.remove('open');
-        }
+}
+
 // ---------- Chat ----------
 
 const chatEl = $('#chat');
@@ -296,8 +297,7 @@ function addMessage({ who, text, attachments = [], pending = false }) {
   row.className = 'msg-row ' + who;
 
   const orb = document.createElement('div');
-  orb.className = 'orb orb--sm';
-  if (who === 'ai') {
+  orb.className = 'orb orb--sm';if (who === 'ai') {
     orb.setAttribute('data-brand-orb', '');
   } else {
     orb.style.background = 'linear-gradient(135deg, #4b4664, #6f6789)';
@@ -596,8 +596,7 @@ async function loadAdminUsers() {
         await fetch('/admin/users/' + btn.dataset.user, { method: 'DELETE', headers: authHeaders() });
         loadAdminUsers();
       })
-    );
-  } catch (e) {
+    );} catch (e) {
     el.innerHTML = '<div class="empty-admin">Erro ao carregar usuários.</div>';
   }
 }
@@ -628,10 +627,12 @@ async function loadAdminSuggestions() {
         <pre>${esc(s.code)}</pre>
         <div class="admin-actions">
           <button class="ghost-btn" data-action="copy">Copiar código</button>
+          <button class="ghost-btn" data-action="test">▶ Testar</button>
           <button class="ghost-btn accent" data-action="aprovada">Marcar aprovada</button>
           <button class="ghost-btn" data-action="rejeitada">Rejeitar</button>
           <button class="danger-btn" data-action="delete">Excluir</button>
         </div>
+        <div class="sandbox-output" style="display:none"></div>
       </div>
     `).join('');
 
@@ -639,6 +640,39 @@ async function loadAdminSuggestions() {
       const id = card.dataset.id;
       card.querySelector('[data-action="copy"]').addEventListener('click', () => {
         navigator.clipboard.writeText(card.querySelector('pre').textContent);
+      });
+      card.querySelector('[data-action="test"]').addEventListener('click', async (e) => {
+        const btn = e.currentTarget;
+        const outputBox = card.querySelector('.sandbox-output');
+        btn.disabled = true;
+        btn.textContent = '⏳ Rodando...';
+        outputBox.style.display = 'block';
+        outputBox.className = 'sandbox-output running';
+        outputBox.textContent = 'Executando em ambiente isolado...';
+        try {
+          const res = await fetch('/admin/sandbox/run', {
+            method: 'POST',
+            headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ suggestion_id: id }),
+          });
+          const result = await res.json();
+          if (!res.ok) {
+            outputBox.className = 'sandbox-output error';
+            outputBox.textContent = 'Erro: ' + (result.detail || 'algo deu errado');
+          } else {
+            const ok = result.exit_code === 0 && !result.timed_out;
+            outputBox.className = 'sandbox-output ' + (ok ? 'success' : 'error');
+            let text = `exit code: ${result.exit_code} · ${result.duration_seconds}s\n`;
+            if (result.timed_out) text += `⏱️ Tempo esgotado.\n`;
+            text += `\n--- stdout ---\n${result.stdout || '(vazio)'}\n\n--- stderr ---\n${result.stderr || '(vazio)'}`;
+            outputBox.textContent = text;
+          }
+        } catch (err) {
+          outputBox.className = 'sandbox-output error';
+          outputBox.textContent = 'Erro de conexão: ' + err.message;
+        }
+        btn.disabled = false;
+        btn.textContent = '▶ Testar';
       });
       card.querySelector('[data-action="aprovada"]').addEventListener('click', () => setSuggestionStatus(id, 'aprovada'));
       card.querySelector('[data-action="rejeitada"]').addEventListener('click', () => setSuggestionStatus(id, 'rejeitada'));
