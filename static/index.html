@@ -9,6 +9,13 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/static/style.css">
+
+<!-- Renderização de Markdown (negrito, títulos, listas) e highlight de código -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/4.3.0/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
+<!-- Sanitiza o HTML gerado, por segurança -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.5/purify.min.js"></script>
 </head>
 <body>
 
@@ -115,10 +122,9 @@
         <div class="admin-field">
           <label>Modelo (Groq)</label>
           <select id="cfgModel">
-            <option value="llama-3.3-70b-versatile">llama-3.3-70b-versatile (padrão, equilibrado)</option>
-            <option value="llama-3.1-8b-instant">llama-3.1-8b-instant (mais rápido)</option>
-            <option value="meta-llama/llama-4-scout-17b-16e-instruct">llama-4-scout (multimodal)</option>
-            <option value="meta-llama/llama-4-maverick-17b-128e-instruct">llama-4-maverick (mais forte)</option>
+            <option value="openai/gpt-oss-120b">openai/gpt-oss-120b (padrão, equilibrado)</option>
+            <option value="openai/gpt-oss-20b">openai/gpt-oss-20b (mais rápido)</option>
+            <option value="qwen/qwen3.6-27b">qwen/qwen3.6-27b (multimodal)</option>
           </select>
         </div>
         <div class="admin-actions">
@@ -148,4 +154,4 @@
 
 <script src="/static/app.js"></script>
 </body>
-</html>
+  </html>
