@@ -8,10 +8,15 @@ memória de conversa por usuário (com histórico de sessões), aceita
 imagens e arquivos (PDF/texto), permite personalização visual (ícone)
 e dá à administradora um painel com estatísticas de uso.
 
+Persistência: usuários, tokens, sessões, sugestões, histórico de
+conversas e configuração (nome/personalidade/modelo) ficam salvos no
+Postgres do Supabase (via DATABASE_URL), então nada se perde quando o
+Render reinicia o serviço.
+
 Recursos de "autoedição" (o que a Kyky pode / não pode alterar sozinha):
   - Ela PODE ajustar o próprio nome e um bloco de "notas de personalidade"
     (tom, preferências, contexto extra) através de uma ferramenta exposta
-    só nas conversas com a administradora. Isso é gravado em config.json,
+    só nas conversas com a administradora. Isso é gravado no banco,
     nunca no código-fonte.
   - Ela PODE propor trechos de código como sugestão (fica pendente para
     a administradora revisar e aplicar manualmente). Ela nunca escreve
@@ -19,14 +24,18 @@ Recursos de "autoedição" (o que a Kyky pode / não pode alterar sozinha):
   - As regras de segurança e ética em BASE_PERSONALITY são fixas no
     código e não são editáveis por ela, por design.
 
-Pré-requisito: uma chave de API gratuita do Groq (console.groq.com).
+Pré-requisitos:
+  - uma chave de API gratuita do Groq (console.groq.com)
+  - um projeto no Supabase, com as tabelas criadas (ver guia de migração)
+    e a variável de ambiente DATABASE_URL apontando para ele
 
 Como rodar localmente pra testar:
     1. pip install -r requirements.txt
     2. export GROQ_API_KEY="sua-chave-aqui"
-    3. python main.py
-    4. Abra http://localhost:8000 no navegador
-    5. Cadastre-se primeiro -> você vira admin automaticamente
+    3. export DATABASE_URL="postgresql://...supabase.co:6543/postgres"
+    4. python main.py
+    5. Abra http://localhost:8000 no navegador
+    6. Cadastre-se primeiro -> você vira admin automaticamente
 
 Como colocar em produção (grátis): veja o README.md.
 """
@@ -35,7 +44,6 @@ import os
 import json
 import uuid
 import base64
-import sqlite3
 import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -43,6 +51,8 @@ from pathlib import Path
 from contextlib import contextmanager
 
 import requests
+import psycopg2
+import psycopg2.extras
 from fastapi import FastAPI, HTTPException, Header, Depends, UploadFile, File
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -54,22 +64,18 @@ from pydantic import BaseModel
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
-VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "qwen/qwen3.6-27b")
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 BASE_DIR = Path(__file__).parent
-MEMORY_DIR = BASE_DIR / "memoria"
-MEMORY_DIR.mkdir(exist_ok=True)
-UPLOAD_DIR = BASE_DIR / "uploads"
-UPLOAD_DIR.mkdir(exist_ok=True)
 STATIC_DIR = BASE_DIR / "static"
-DB_PATH = BASE_DIR / "kyky.db"
-CONFIG_PATH = BASE_DIR / "config.json"
 
 DEFAULT_AI_NAME = "Kyky"
 
 # Personalidade base. FIXA no código - a IA não pode alterar isto, só as
-# "notas de personalidade" guardadas em config.json (ver PERSONALITY_NOTES
+# "notas de personalidade" guardadas no banco (ver PERSONALITY_NOTES
 # abaixo). Isso garante que princípios de segurança não sejam contornáveis
 # por autoedição.
 BASE_PERSONALITY_TEMPLATE = """\
@@ -114,13 +120,6 @@ usar você. Trate com a mesma qualidade e cuidado, mas sem tratá-la como \
 administradora do sistema, e sem usar as ferramentas de autoedição.
 """
 
-
-# ---------------------------------------------------------------------------
-# Configuração editável (config.json) - aqui vivem nome, notas de
-# personalidade, modelo e ícone. Isto é o que a autoedição/pai­nel admin
-# alteram; o código-fonte nunca é tocado.
-# ---------------------------------------------------------------------------
-
 DEFAULT_CONFIG = {
     "ai_name": DEFAULT_AI_NAME,
     "personality_notes": "",
@@ -129,32 +128,21 @@ DEFAULT_CONFIG = {
 }
 
 
-def load_config() -> dict:
-    if CONFIG_PATH.exists():
-        try:
-            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            data = {}
-        merged = {**DEFAULT_CONFIG, **data}
-        return merged
-    return dict(DEFAULT_CONFIG)
-
-
-def save_config(cfg: dict) -> None:
-    CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
 # ---------------------------------------------------------------------------
-# Banco de dados (usuários, tokens, sessões, sugestões de código)
+# Banco de dados (Postgres / Supabase)
 # ---------------------------------------------------------------------------
 
 @contextmanager
 def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL não configurada.")
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
     try:
         yield conn
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -163,50 +151,38 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def init_db():
+# ---------------------------------------------------------------------------
+# Configuração editável (tabela app_config) - aqui vivem nome, notas de
+# personalidade, modelo e ícone. Isto é o que a autoedição/painel admin
+# alteram; o código-fonte nunca é tocado.
+# ---------------------------------------------------------------------------
+
+def load_config() -> dict:
     with db() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                username TEXT PRIMARY KEY,
-                password_hash TEXT NOT NULL,
-                salt TEXT NOT NULL,
-                role TEXT NOT NULL DEFAULT 'user',
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS tokens (
-                token TEXT PRIMARY KEY,
-                username TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS sessions (
-                session_id TEXT PRIMARY KEY,
-                username TEXT NOT NULL,
-                title TEXT NOT NULL DEFAULT 'Nova conversa',
-                message_count INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS suggestions (
-                id TEXT PRIMARY KEY,
-                username TEXT NOT NULL,
-                title TEXT NOT NULL,
-                description TEXT NOT NULL,
-                code TEXT NOT NULL,
-                file_hint TEXT,
-                status TEXT NOT NULL DEFAULT 'pendente',
-                created_at TEXT NOT NULL
-            )
-        """)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT ai_name, personality_notes, icon_url, model FROM app_config WHERE id = 1"
+        )
+        row = cur.fetchone()
+        return dict(row) if row else dict(DEFAULT_CONFIG)
 
 
-init_db()
+def save_config(cfg: dict) -> None:
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE app_config
+            SET ai_name = %s, personality_notes = %s, icon_url = %s, model = %s
+            WHERE id = 1
+            """,
+            (cfg["ai_name"], cfg["personality_notes"], cfg["icon_url"], cfg["model"]),
+        )
 
+
+# ---------------------------------------------------------------------------
+# Usuários / tokens
+# ---------------------------------------------------------------------------
 
 def hash_password(password: str, salt: str) -> str:
     return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 200_000).hex()
@@ -214,24 +190,28 @@ def hash_password(password: str, salt: str) -> str:
 
 def create_user(username: str, password: str) -> str:
     with db() as conn:
-        existing_count = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) AS c FROM users")
+        existing_count = cur.fetchone()["c"]
         role = "admin" if existing_count == 0 else "user"
 
         salt = secrets.token_hex(16)
         pw_hash = hash_password(password, salt)
         try:
-            conn.execute(
-                "INSERT INTO users (username, password_hash, salt, role) VALUES (?, ?, ?, ?)",
+            cur.execute(
+                "INSERT INTO users (username, password_hash, salt, role) VALUES (%s, %s, %s, %s)",
                 (username, pw_hash, salt, role),
             )
-        except sqlite3.IntegrityError:
+        except psycopg2.errors.UniqueViolation:
             raise HTTPException(status_code=400, detail="Esse nome de usuário já existe.")
         return role
 
 
 def verify_login(username: str, password: str) -> str:
     with db() as conn:
-        row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM users WHERE username = %s", (username,))
+        row = cur.fetchone()
         if row is None:
             raise HTTPException(status_code=401, detail="Usuário ou senha inválidos.")
         if hash_password(password, row["salt"]) != row["password_hash"]:
@@ -242,7 +222,8 @@ def verify_login(username: str, password: str) -> str:
 def issue_token(username: str) -> str:
     token = secrets.token_urlsafe(32)
     with db() as conn:
-        conn.execute("INSERT INTO tokens (token, username) VALUES (?, ?)", (token, username))
+        cur = conn.cursor()
+        cur.execute("INSERT INTO tokens (token, username) VALUES (%s, %s)", (token, username))
     return token
 
 
@@ -251,12 +232,14 @@ def user_from_token(authorization: str | None = Header(default=None)) -> dict:
         raise HTTPException(status_code=401, detail="Não autenticado.")
     token = authorization.removeprefix("Bearer ").strip()
     with db() as conn:
-        row = conn.execute(
+        cur = conn.cursor()
+        cur.execute(
             "SELECT tokens.username AS username, users.role AS role "
             "FROM tokens JOIN users ON tokens.username = users.username "
-            "WHERE tokens.token = ?",
+            "WHERE tokens.token = %s",
             (token,),
-        ).fetchone()
+        )
+        row = cur.fetchone()
         if row is None:
             raise HTTPException(status_code=401, detail="Sessão inválida, faça login de novo.")
         return {"username": row["username"], "role": row["role"]}
@@ -269,45 +252,46 @@ def require_admin(user: dict = Depends(user_from_token)) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Sessões (metadados: título, timestamps) - o conteúdo completo continua
-# num JSON por sessão, mas agora listamos/gerenciamos via tabela.
+# Sessões (metadados: título, timestamps)
 # ---------------------------------------------------------------------------
 
 def touch_session(username: str, session_id: str, first_message: str | None, msg_count: int) -> None:
     with db() as conn:
-        row = conn.execute(
-            "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
-        ).fetchone()
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM sessions WHERE session_id = %s", (session_id,))
+        exists = cur.fetchone() is not None
         ts = now_iso()
-        if row is None:
+        if not exists:
             title = (first_message or "Nova conversa").strip().replace("\n", " ")
             title = (title[:42] + "…") if len(title) > 42 else title
-            conn.execute(
+            cur.execute(
                 "INSERT INTO sessions (session_id, username, title, message_count, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "VALUES (%s, %s, %s, %s, %s, %s)",
                 (session_id, username, title or "Nova conversa", msg_count, ts, ts),
             )
         else:
-            conn.execute(
-                "UPDATE sessions SET message_count = ?, updated_at = ? WHERE session_id = ?",
+            cur.execute(
+                "UPDATE sessions SET message_count = %s, updated_at = %s WHERE session_id = %s",
                 (msg_count, ts, session_id),
             )
 
 
 def list_sessions(username: str) -> list:
     with db() as conn:
-        rows = conn.execute(
+        cur = conn.cursor()
+        cur.execute(
             "SELECT session_id, title, message_count, created_at, updated_at "
-            "FROM sessions WHERE username = ? ORDER BY updated_at DESC",
+            "FROM sessions WHERE username = %s ORDER BY updated_at DESC",
             (username,),
-        ).fetchall()
-        return [dict(r) for r in rows]
+        )
+        return [dict(r) for r in cur.fetchall()]
 
 
 def rename_session(username: str, session_id: str, title: str) -> None:
     with db() as conn:
-        cur = conn.execute(
-            "UPDATE sessions SET title = ? WHERE session_id = ? AND username = ?",
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE sessions SET title = %s WHERE session_id = %s AND username = %s",
             (title[:80], session_id, username),
         )
         if cur.rowcount == 0:
@@ -316,33 +300,49 @@ def rename_session(username: str, session_id: str, title: str) -> None:
 
 def delete_session_row(username: str, session_id: str) -> None:
     with db() as conn:
-        conn.execute(
-            "DELETE FROM sessions WHERE session_id = ? AND username = ?",
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM sessions WHERE session_id = %s AND username = %s",
             (session_id, username),
         )
 
 
 # ---------------------------------------------------------------------------
-# Memória de conversa (um arquivo JSON por usuário+sessão)
+# Memória de conversa (tabela memories, uma linha por usuário+sessão)
 # ---------------------------------------------------------------------------
 
-def memory_path(username: str, session_id: str) -> Path:
-    safe_user = "".join(c for c in username if c.isalnum() or c in "-_")
-    safe_session = "".join(c for c in session_id if c.isalnum() or c in "-_")
-    return MEMORY_DIR / f"{safe_user}__{safe_session}.json"
-
-
 def load_history(username: str, session_id: str) -> list:
-    path = memory_path(username, session_id)
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
-    return []
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT history FROM memories WHERE username = %s AND session_id = %s",
+            (username, session_id),
+        )
+        row = cur.fetchone()
+        return row["history"] if row else []
 
 
 def save_history(username: str, session_id: str, history: list) -> None:
-    memory_path(username, session_id).write_text(
-        json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO memories (username, session_id, history)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (username, session_id)
+            DO UPDATE SET history = EXCLUDED.history
+            """,
+            (username, session_id, json.dumps(history, ensure_ascii=False)),
+        )
+
+
+def delete_history(username: str, session_id: str) -> None:
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM memories WHERE username = %s AND session_id = %s",
+            (username, session_id),
+        )
 
 
 def build_system_prompt(user: dict, cfg: dict) -> str:
@@ -436,9 +436,10 @@ def execute_tool_call(name: str, args: dict, user: dict, cfg: dict) -> tuple[dic
     if name == "sugerir_codigo":
         sug_id = str(uuid.uuid4())
         with db() as conn:
-            conn.execute(
+            cur = conn.cursor()
+            cur.execute(
                 "INSERT INTO suggestions (id, username, title, description, code, file_hint, status, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, 'pendente', ?)",
+                "VALUES (%s, %s, %s, %s, %s, %s, 'pendente', %s)",
                 (
                     sug_id,
                     user["username"],
@@ -465,7 +466,8 @@ def call_groq(messages: list, model: str, tools: list | None = None) -> dict:
         json=payload,
         timeout=60,
     )
-    resp.raise_for_status()
+    if not resp.ok:
+        raise RuntimeError(f"Groq {resp.status_code}: {resp.text}")
     return resp.json()
 
 
@@ -479,6 +481,11 @@ if not GROQ_API_KEY:
     print(
         "[AVISO] GROQ_API_KEY não definida. Pegue uma chave grátis em "
         "console.groq.com e configure antes de conversar."
+    )
+if not DATABASE_URL:
+    print(
+        "[AVISO] DATABASE_URL não definida. Configure a connection string "
+        "do Supabase antes de rodar, ou nada será salvo."
     )
 
 
@@ -533,7 +540,7 @@ def config_public():
 # --- chat -------------------------------------------------------------------
 
 class Attachment(BaseModel):
-    type: str  # "image" ou "texto"
+  type: str  # "image" ou "texto"
     name: str
     data_url: str | None = None       # para imagens (data:...;base64,...)
     extracted_text: str | None = None  # para pdf/texto
@@ -615,7 +622,7 @@ def chat(req: ChatRequest, user: dict = Depends(user_from_token)):
             rounds += 1
 
         reply_text = msg.get("content") or "(sem resposta de texto)"
-    except requests.exceptions.RequestException as e:
+    except (requests.exceptions.RequestException, RuntimeError) as e:
         raise HTTPException(status_code=500, detail=f"Erro ao falar com o Groq: {e}")
 
     history.append({"role": "assistant", "content": reply_text, "attachments": []})
@@ -694,9 +701,7 @@ def get_history(session_id: str, user: dict = Depends(user_from_token)):
 
 @app.delete("/history/{session_id}")
 def clear_history(session_id: str, user: dict = Depends(user_from_token)):
-    path = memory_path(user["username"], session_id)
-    if path.exists():
-        path.unlink()
+    delete_history(user["username"], session_id)
     delete_session_row(user["username"], session_id)
     return {"status": "limpo"}
 
@@ -706,8 +711,9 @@ def clear_history(session_id: str, user: dict = Depends(user_from_token)):
 @app.get("/admin/users")
 def admin_list_users(_: dict = Depends(require_admin)):
     with db() as conn:
-        rows = conn.execute("SELECT username, role, created_at FROM users").fetchall()
-        return [dict(r) for r in rows]
+        cur = conn.cursor()
+        cur.execute("SELECT username, role, created_at FROM users")
+        return [dict(r) for r in cur.fetchall()]
 
 
 @app.delete("/admin/users/{username}")
@@ -715,44 +721,49 @@ def admin_delete_user(username: str, admin: dict = Depends(require_admin)):
     if username == admin["username"]:
         raise HTTPException(status_code=400, detail="Você não pode remover a si mesmo.")
     with db() as conn:
-        conn.execute("DELETE FROM users WHERE username = ?", (username,))
-        conn.execute("DELETE FROM tokens WHERE username = ?", (username,))
-        conn.execute("DELETE FROM sessions WHERE username = ?", (username,))
+        cur = conn.cursor()
+        cur.execute("DELETE FROM users WHERE username = %s", (username,))
+        cur.execute("DELETE FROM tokens WHERE username = %s", (username,))
+        cur.execute("DELETE FROM sessions WHERE username = %s", (username,))
+        cur.execute("DELETE FROM memories WHERE username = %s", (username,))
     return {"status": "removido"}
 
 
 @app.get("/admin/stats")
 def admin_stats(_: dict = Depends(require_admin)):
     with db() as conn:
-        total_users = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
-        total_sessions = conn.execute("SELECT COUNT(*) AS c FROM sessions").fetchone()["c"]
-        total_messages = conn.execute(
-            "SELECT COALESCE(SUM(message_count), 0) AS c FROM sessions"
-        ).fetchone()["c"]
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) AS c FROM users")
+        total_users = cur.fetchone()["c"]
+        cur.execute("SELECT COUNT(*) AS c FROM sessions")
+        total_sessions = cur.fetchone()["c"]
+        cur.execute("SELECT COALESCE(SUM(message_count), 0) AS c FROM sessions")
+        total_messages = cur.fetchone()["c"]
 
         now = datetime.now(timezone.utc)
         cutoff_24h = (now - timedelta(hours=24)).isoformat()
         cutoff_7d = (now - timedelta(days=7)).isoformat()
 
-        active_24h = conn.execute(
-            "SELECT COUNT(DISTINCT username) AS c FROM sessions WHERE updated_at >= ?",
+        cur.execute(
+            "SELECT COUNT(DISTINCT username) AS c FROM sessions WHERE updated_at >= %s",
             (cutoff_24h,),
-        ).fetchone()["c"]
-        active_7d = conn.execute(
-            "SELECT COUNT(DISTINCT username) AS c FROM sessions WHERE updated_at >= ?",
+        )
+        active_24h = cur.fetchone()["c"]
+        cur.execute(
+            "SELECT COUNT(DISTINCT username) AS c FROM sessions WHERE updated_at >= %s",
             (cutoff_7d,),
-        ).fetchone()["c"]
+        )
+        active_7d = cur.fetchone()["c"]
 
-        # mensagens por dia, últimos 14 dias (aproximado por updated_at das sessões)
-        rows = conn.execute(
-            "SELECT substr(updated_at, 1, 10) AS day, COALESCE(SUM(message_count),0) AS c "
+        cur.execute(
+            "SELECT substr(CAST(updated_at AS TEXT), 1, 10) AS day, COALESCE(SUM(message_count),0) AS c "
             "FROM sessions GROUP BY day ORDER BY day DESC LIMIT 14"
-        ).fetchall()
+        )
+        rows = cur.fetchall()
         by_day = [{"day": r["day"], "messages": r["c"]} for r in reversed(rows)]
 
-        pending_suggestions = conn.execute(
-            "SELECT COUNT(*) AS c FROM suggestions WHERE status = 'pendente'"
-        ).fetchone()["c"]
+        cur.execute("SELECT COUNT(*) AS c FROM suggestions WHERE status = 'pendente'")
+        pending_suggestions = cur.fetchone()["c"]
 
         return {
             "total_users": total_users,
@@ -815,6 +826,8 @@ async def admin_upload_icon(file: UploadFile = File(...), _: dict = Depends(requ
     elif "webp" in content_type:
         ext = ".webp"
 
+    # AVISO: isto ainda salva em disco local, que é apagado em reinícios do
+    # Render. Para persistir o ícone de verdade, migre para Supabase Storage.
     icon_path = STATIC_DIR / f"icon{ext}"
     icon_path.write_bytes(raw)
 
@@ -827,10 +840,9 @@ async def admin_upload_icon(file: UploadFile = File(...), _: dict = Depends(requ
 @app.get("/admin/suggestions")
 def admin_list_suggestions(_: dict = Depends(require_admin)):
     with db() as conn:
-        rows = conn.execute(
-            "SELECT * FROM suggestions ORDER BY created_at DESC"
-        ).fetchall()
-        return [dict(r) for r in rows]
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM suggestions ORDER BY created_at DESC")
+        return [dict(r) for r in cur.fetchall()]
 
 
 class SuggestionStatusRequest(BaseModel):
@@ -844,8 +856,9 @@ def admin_set_suggestion_status(
     if req.status not in ("pendente", "aprovada", "rejeitada"):
         raise HTTPException(status_code=400, detail="Status inválido.")
     with db() as conn:
-        conn.execute(
-            "UPDATE suggestions SET status = ? WHERE id = ?", (req.status, sug_id)
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE suggestions SET status = %s WHERE id = %s", (req.status, sug_id)
         )
     return {"status": "ok"}
 
@@ -853,9 +866,9 @@ def admin_set_suggestion_status(
 @app.delete("/admin/suggestions/{sug_id}")
 def admin_delete_suggestion(sug_id: str, _: dict = Depends(require_admin)):
     with db() as conn:
-        conn.execute("DELETE FROM suggestions WHERE id = ?", (sug_id,))
+        cur = conn.cursor()
+        cur.execute("DELETE FROM suggestions WHERE id = %s", (sug_id,))
     return {"status": "removido"}
-
 
 # ---------------------------------------------------------------------------
 # Interface web
@@ -873,4 +886,4 @@ if __name__ == "__main__":
     import uvicorn
 
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0",
