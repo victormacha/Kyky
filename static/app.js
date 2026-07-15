@@ -11,6 +11,36 @@ let pendingAttachments = []; // {type, name, data_url?, extracted_text?}
 
 const $ = (sel) => document.querySelector(sel);
 
+// ---------- Renderização de Markdown + código colorido ----------
+
+marked.setOptions({
+  breaks: true, // Enter simples já quebra linha, como no WhatsApp
+  gfm: true,
+  highlight: function (code, lang) {
+    try {
+      if (lang && hljs.getLanguage(lang)) {
+        return hljs.highlight(code, { language: lang }).value;
+      }
+      return hljs.highlightAuto(code).value;
+    } catch (e) {
+      return code;
+    }
+  },
+});
+
+function renderContentToHtml(text) {
+  if (!text) return '';
+  try {
+    const html = marked.parse(text);
+    // Sanitiza o HTML gerado, por segurança (evita que algo malicioso
+    // vindo de um anexo ou de uma resposta da IA vire código executável).
+    return window.DOMPurify ? DOMPurify.sanitize(html) : html;
+  } catch (e) {
+    const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return `<p>${esc(text)}</p>`;
+  }
+}
+
 // ---------- Marca (nome + ícone) aplicada em qualquer tela ----------
 
 function applyBrandToOrb(orbEl) {
@@ -250,8 +280,7 @@ function clearChatView() {
 $('#menuToggle').addEventListener('click', () => $('#sidebar').classList.toggle('open'));
 function closeSidebarMobile() {
   if (window.innerWidth <= 760) $('#sidebar').classList.remove('open');
-}
-
+        }
 // ---------- Chat ----------
 
 const chatEl = $('#chat');
@@ -260,15 +289,6 @@ const sendBtn = $('#sendBtn');
 
 function authHeaders() {
   return { Authorization: 'Bearer ' + token };
-}
-
-function renderContentToHtml(text) {
-  // Escapa HTML e formata blocos de código simples (```...```) e `inline`.
-  const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  let safe = esc(text);
-  safe = safe.replace(/```([\s\S]*?)```/g, (_, code) => `<pre>${code}</pre>`);
-  safe = safe.replace(/`([^`]+)`/g, (_, code) => `<code>${code}</code>`);
-  return safe;
 }
 
 function addMessage({ who, text, attachments = [], pending = false }) {
