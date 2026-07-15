@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kyky</title>
+<link rel="icon" href="/static/icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<!-- ========== Tela de login/cadastro ========== -->
+<div id="authScreen">
+  <div id="authBox">
+    <div class="auth-header">
+      <div class="orb orb--md" data-brand-orb></div>
+      <h1 class="brand-name">Kyky</h1>
+    </div>
+    <p class="sub" id="authSub">Entre com sua conta</p>
+
+    <div class="field">
+      <label>Usuário</label>
+      <input id="authUser" placeholder="seu nome de usuário" autocomplete="username">
+    </div>
+    <div class="field">
+      <label>Senha</label>
+      <input id="authPass" type="password" placeholder="••••••••" autocomplete="current-password">
+    </div>
+    <button id="authSubmit">Entrar</button>
+
+    <div id="authError"></div>
+
+    <div class="toggle">
+      <span id="toggleText">Não tem conta? <a id="toggleLink">Cadastre-se</a></span>
+    </div>
+  </div>
+</div>
+
+<!-- ========== App principal ========== -->
+<div id="appScreen">
+
+  <aside id="sidebar">
+    <div class="sidebar-header">
+      <div class="orb orb--sm" data-brand-orb></div>
+      <span class="brand-name">Kyky</span>
+    </div>
+
+    <button id="newChatBtn">＋ Nova conversa</button>
+
+    <div id="sessionList"></div>
+
+    <div class="sidebar-footer">
+      <div class="who"><span id="whoami"></span></div>
+      <div class="footer-actions">
+        <button id="adminPanelBtn" class="ghost-btn accent" style="display:none">Painel admin</button>
+        <button id="logoutBtn" class="ghost-btn">Sair</button>
+      </div>
+    </div>
+  </aside>
+
+  <main id="chatArea">
+    <div id="chatHeader">
+      <button id="menuToggle">☰</button>
+      <div id="chatTitle">Nova conversa</div>
+    </div>
+
+    <div id="chat"></div>
+
+    <div id="inputBar">
+      <div id="pendingAttachments"></div>
+      <div class="input-shell">
+        <button id="attachBtn" title="Anexar imagem, PDF ou texto">📎</button>
+        <textarea id="input" placeholder="Digite sua mensagem..." rows="1"></textarea>
+        <button id="sendBtn">➤</button>
+      </div>
+      <div class="hint">Enter envia · Shift+Enter quebra linha · imagens, PDFs e .txt são aceitos</div>
+      <input type="file" id="attachInput" accept="image/*,.pdf,.txt,.md,.csv" multiple style="display:none">
+    </div>
+  </main>
+
+</div>
+
+<!-- ========== Painel de administração ========== -->
+<div id="adminOverlay">
+  <div id="adminDrawer">
+    <div class="admin-header">
+      <h2>Painel admin</h2>
+      <button id="adminClose">✕</button>
+    </div>
+
+    <div class="admin-tabs">
+      <button class="admin-tab active" data-tab="overview">Visão geral</button>
+      <button class="admin-tab" data-tab="personality">Personalidade</button>
+      <button class="admin-tab" data-tab="users">Usuários</button>
+      <button class="admin-tab" data-tab="suggestions">Sugestões</button>
+    </div>
+
+    <div class="admin-body">
+
+      <div class="admin-panel active" id="panel-overview"></div>
+
+      <div class="admin-panel" id="panel-personality">
+        <div class="admin-field">
+          <label>Nome</label>
+          <input id="cfgName" maxlength="40">
+        </div>
+        <div class="admin-field">
+          <label>Notas de personalidade</label>
+          <textarea id="cfgNotes" placeholder="Tom de voz, preferências, contexto extra que a Kyky deve levar em conta. Ela também pode editar isso sozinha quando você pedir no chat."></textarea>
+          <div class="hint-sm">As regras de segurança e ética são fixas no código e não aparecem aqui.</div>
+        </div>
+        <div class="admin-field">
+          <label>Modelo (Groq)</label>
+          <select id="cfgModel">
+            <option value="llama-3.3-70b-versatile">llama-3.3-70b-versatile (padrão, equilibrado)</option>
+            <option value="llama-3.1-8b-instant">llama-3.1-8b-instant (mais rápido)</option>
+            <option value="meta-llama/llama-4-scout-17b-16e-instruct">llama-4-scout (multimodal)</option>
+            <option value="meta-llama/llama-4-maverick-17b-128e-instruct">llama-4-maverick (mais forte)</option>
+          </select>
+        </div>
+        <div class="admin-actions">
+          <button id="cfgSaveBtn" class="primary-btn">Salvar</button>
+          <button id="cfgResetBtn" class="ghost-btn">Restaurar padrão</button>
+          <span id="cfgSavedMsg" class="hint-sm"></span>
+        </div>
+
+        <div class="admin-field" style="margin-top:10px;">
+          <label>Ícone</label>
+          <div class="icon-upload-row">
+            <div class="orb orb--lg" data-brand-orb></div>
+            <label class="upload-btn" for="iconInput">Trocar ícone</label>
+            <input type="file" id="iconInput" accept="image/*">
+            <span id="iconPreviewMsg" class="hint-sm"></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="admin-panel" id="panel-users"></div>
+
+      <div class="admin-panel" id="panel-suggestions"></div>
+
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
