@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kyky</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --accent: #7c9eff;
+    --text: #e6e8ee;
+    --muted: #8a8f9c;
+    --bubble-user: #2b3350;
+    --bubble-ai: #1e2230;
+    --danger: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* ---------- Tela de login/cadastro ---------- */
+  #authScreen {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  #authBox {
+    background: var(--panel);
+    border: 1px solid #262a35;
+    border-radius: 12px;
+    padding: 32px;
+    width: 320px;
+  }
+  #authBox h1 {
+    margin: 0 0 4px;
+    font-size: 22px;
+    color: var(--accent);
+  }
+  #authBox p.sub {
+    color: var(--muted);
+    font-size: 13px;
+    margin: 0 0 20px;
+  }
+  #authBox input {
+    width: 100%;
+    background: #10131a;
+    border: 1px solid #2a2f3d;
+    color: var(--text);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 14px;
+    margin-bottom: 10px;
+  }
+  #authBox button {
+    width: 100%;
+    background: var(--accent);
+    border: none;
+    color: #0f1115;
+    padding: 10px;
+    border-radius: 8px;
+    font-weight: 600;
+    cursor: pointer;
+    margin-top: 4px;
+  }
+  #authBox .toggle {
+    text-align: center;
+    margin-top: 14px;
+    font-size: 13px;
+    color: var(--muted);
+  }
+  #authBox .toggle a { color: var(--accent); cursor: pointer; text-decoration: none; }
+  #authError { color: var(--danger); font-size: 13px; margin-top: 8px; min-height: 16px; }
+
+  /* ---------- Tela de chat ---------- */
+  #appScreen { display: none; flex: 1; flex-direction: column; min-height: 0; }
+
+  header {
+    padding: 14px 24px;
+    background: var(--panel);
+    border-bottom: 1px solid #262a35;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; color: var(--accent); }
+  header .right { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--muted); }
+  header button {
+    background: none;
+    border: 1px solid #333848;
+    color: var(--muted);
+    padding: 6px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  header button:hover { color: var(--text); border-color: var(--accent); }
+  .badge {
+    background: #2b3350;
+    color: var(--accent);
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+  }
+
+  #chat {
+    flex: 1;
+    overflow-y: auto;
+    padding: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .msg {
+    max-width: 70%;
+    padding: 10px 14px;
+    border-radius: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    font-size: 14px;
+  }
+  .user { align-self: flex-end; background: var(--bubble-user); border-bottom-right-radius: 2px; }
+  .ai { align-self: flex-start; background: var(--bubble-ai); border-bottom-left-radius: 2px; }
+  .ai.pending { color: var(--muted); font-style: italic; }
+
+  #inputBar {
+    display: flex;
+    padding: 16px;
+    background: var(--panel);
+    border-top: 1px solid #262a35;
+    gap: 10px;
+  }
+  #inputBar textarea {
+    flex: 1;
+    resize: none;
+    background: #10131a;
+    border: 1px solid #2a2f3d;
+    color: var(--text);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 14px;
+    font-family: inherit;
+    height: 44px;
+  }
+  #inputBar button {
+    background: var(--accent);
+    border: none;
+    color: #0f1115;
+    padding: 0 20px;
+    border-radius: 8px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  #inputBar button:disabled { opacity: 0.5; cursor: default; }
+</style>
+</head>
+<body>
+
+<!-- ---------- Tela de login/cadastro ---------- -->
+<div id="authScreen">
+  <div id="authBox">
+    <h1>🤖 Kyky</h1>
+    <p class="sub" id="authSub">Entre com sua conta</p>
+
+    <input id="authUser" placeholder="Usuário" autocomplete="username">
+    <input id="authPass" type="password" placeholder="Senha" autocomplete="current-password">
+    <button id="authSubmit">Entrar</button>
+
+    <div id="authError"></div>
+
+    <div class="toggle">
+      <span id="toggleText">Não tem conta? <a id="toggleLink">Cadastre-se</a></span>
+    </div>
+  </div>
+</div>
+
+<!-- ---------- Tela de chat ---------- -->
+<div id="appScreen">
+  <header>
+    <h1>🤖 Kyky</h1>
+    <div class="right">
+      <span id="whoami"></span>
+      <button id="clearBtn">Limpar conversa</button>
+      <button id="logoutBtn">Sair</button>
+    </div>
+  </header>
+
+  <div id="chat"></div>
+
+  <div id="inputBar">
+    <textarea id="input" placeholder="Digite sua mensagem... (Enter envia, Shift+Enter quebra linha)"></textarea>
+    <button id="sendBtn">Enviar</button>
+  </div>
+</div>
+
+<script>
+let token = localStorage.getItem('kykyToken') || null;
+let currentUser = null;
+let sessionId = localStorage.getItem('kykySessionId') || null;
+let isRegisterMode = false;
+
+const authScreen = document.getElementById('authScreen');
+const appScreen = document.getElementById('appScreen');
+const authUser = document.getElementById('authUser');
+const authPass = document.getElementById('authPass');
+const authSubmit = document.getElementById('authSubmit');
+const authError = document.getElementById('authError');
+const authSub = document.getElementById('authSub');
+const toggleLink = document.getElementById('toggleLink');
+const toggleText = document.getElementById('toggleText');
+
+toggleLink.addEventListener('click', () => {
+  isRegisterMode = !isRegisterMode;
+  authSubmit.textContent = isRegisterMode ? 'Cadastrar' : 'Entrar';
+  authSub.textContent = isRegisterMode
+    ? 'Crie sua conta (a primeira conta criada vira admin)'
+    : 'Entre com sua conta';
+  toggleText.innerHTML = isRegisterMode
+    ? 'Já tem conta? <a id="toggleLink2">Entrar</a>'
+    : 'Não tem conta? <a id="toggleLink2">Cadastre-se</a>';
+  document.getElementById('toggleLink2').addEventListener('click', () => toggleLink.click());
+  authError.textContent = '';
+});
+
+authSubmit.addEventListener('click', async () => {
+  const username = authUser.value.trim();
+  const password = authPass.value;
+  authError.textContent = '';
+
+  if (!username || !password) {
+    authError.textContent = 'Preencha usuário e senha.';
+    return;
+  }
+
+  const endpoint = isRegisterMode ? '/register' : '/login';
+  try {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      authError.textContent = data.detail || 'Erro ao autenticar.';
+      return;
+    }
+    token = data.token;
+    currentUser = { username: data.username, role: data.role };
+    localStorage.setItem('kykyToken', token);
+    showApp();
+  } catch (err) {
+    authError.textContent = 'Erro de conexão: ' + err.message;
+  }
+});
+
+function showAuth() {
+  authScreen.style.display = 'flex';
+  appScreen.style.display = 'none';
+}
+
+async function showApp() {
+  authScreen.style.display = 'none';
+  appScreen.style.display = 'flex';
+  document.getElementById('whoami').innerHTML =
+    currentUser.username + (currentUser.role === 'admin' ? ' <span class="badge">admin</span>' : '');
+  document.getElementById('chat').innerHTML = '';
+  await loadHistory();
+}
+
+document.getElementById('logoutBtn').addEventListener('click', () => {
+  token = null;
+  currentUser = null;
+  localStorage.removeItem('kykyToken');
+  localStorage.removeItem('kykySessionId');
+  sessionId = null;
+  showAuth();
+});
+
+// ---------- Chat ----------
+
+const chatEl = document.getElementById('chat');
+const inputEl = document.getElementById('input');
+const sendBtn = document.getElementById('sendBtn');
+const clearBtn = document.getElementById('clearBtn');
+
+function addMessage(text, who) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + who;
+  div.textContent = text;
+  chatEl.appendChild(div);
+  chatEl.scrollTop = chatEl.scrollHeight;
+  return div;
+}
+
+async function send() {
+  const text = inputEl.value.trim();
+  if (!text) return;
+  inputEl.value = '';
+  sendBtn.disabled = true;
+
+  addMessage(text, 'user');
+  const pending = addMessage('pensando...', 'ai');
+  pending.classList.add('pending');
+
+  try {
+    const res = await fetch('/chat', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + token
+      },
+      body: JSON.stringify({ session_id: sessionId, message: text })
+    });
+    const data = await res.json();
+
+    if (res.status === 401) {
+      showAuth();
+      return;
+    }
+    if (!res.ok) {
+      pending.textContent = 'Erro: ' + (data.detail || 'algo deu errado');
+      pending.classList.remove('pending');
+      sendBtn.disabled = false;
+      return;
+    }
+
+    sessionId = data.session_id;
+    localStorage.setItem('kykySessionId', sessionId);
+
+    pending.textContent = data.reply;
+    pending.classList.remove('pending');
+  } catch (err) {
+    pending.textContent = 'Erro de conexão: ' + err.message;
+    pending.classList.remove('pending');
+  }
+  sendBtn.disabled = false;
+  inputEl.focus();
+}
+
+sendBtn.addEventListener('click', send);
+inputEl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    send();
+  }
+});
+
+clearBtn.addEventListener('click', async () => {
+  if (!sessionId) return;
+  await fetch('/history/' + sessionId, {
+    method: 'DELETE',
+    headers: { 'Authorization': 'Bearer ' + token }
+  });
+  chatEl.innerHTML = '';
+  localStorage.removeItem('kykySessionId');
+  sessionId = null;
+});
+
+async function loadHistory() {
+  if (!sessionId) return;
+  try {
+    const res = await fetch('/history/' + sessionId, {
+      headers: { 'Authorization': 'Bearer ' + token }
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+    for (const m of data.history) {
+      addMessage(m.content, m.role === 'user' ? 'user' : 'ai');
+    }
+  } catch (e) { /* sessão nova, ignora */ }
+}
+
+// ---------- Inicialização ----------
+
+(async function init() {
+  if (!token) {
+    showAuth();
+    return;
+  }
+  try {
+    const res = await fetch('/me', { headers: { 'Authorization': 'Bearer ' + token } });
+    if (!res.ok) {
+      showAuth();
+      return;
+    }
+    currentUser = await res.json();
+    showApp();
+  } catch (e) {
+    showAuth();
+  }
+})();
+</script>
+
+</body>
+</html>
