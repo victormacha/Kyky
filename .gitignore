@@ -3,4 +3,10 @@ __pycache__/
 venv/
 *.db
 memoria/
+uploads/
+config.json
+static/icon.png
+static/icon.jpg
+static/icon.webp
+static/icon.svg
 .env
