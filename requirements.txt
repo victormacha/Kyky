@@ -1,10 +1,6 @@
 fastapi
 uvicorn
-sqlite3
 requests
 pydantic
 python-multipart
-opencv-python
-pillow
-tensorflow
-numpy
+pypdf
