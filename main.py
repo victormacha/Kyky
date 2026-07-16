@@ -138,8 +138,13 @@ LOCAL_AGENT_SAFE_ACTIONS = {
     "status_sistema": "Retorna uso de CPU, memória RAM e disco no momento.",
     "travar_tela": "Bloqueia a tela do Windows (Win+L).",
     "volume_mudo": "Ativa/desativa o mudo do sistema.",
+    "pesquisar_web": "Abre o Google já pesquisando o termo informado (argumento = termo de busca, texto puro).",
+    "midia_tocar_pausar": "Toca ou pausa o player de mídia que estiver ativo no momento (ex: Spotify, YouTube). Não abre o player sozinho - ele precisa já estar aberto.",
+    "midia_proxima": "Pula para a próxima faixa/vídeo no player de mídia ativo.",
+    "midia_anterior": "Volta para a faixa/vídeo anterior no player de mídia ativo.",
+    "midia_volume_subir": "Aumenta o volume de mídia. Argumento opcional: número de vezes a repetir (padrão 1).",
+    "midia_volume_descer": "Diminui o volume de mídia. Argumento opcional: número de vezes a repetir (padrão 1).",
 }
-
 # Ações "sensíveis" - SEMPRE ficam marcadas com sensitive=true na fila. O
 # Agente Local mostra um popup de confirmação físico na tela da Kyo antes de
 # rodar qualquer uma delas, mesmo que a Kyky já tenha "decidido" fazer.
