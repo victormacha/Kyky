@@ -717,3 +717,14 @@ async function setSuggestionStatus(id, status) {
     showAuth();
   }
 })();
+
+// ---------- PWA: registro do service worker ----------
+// Faz o navegador considerar o app "instalável" (ícone próprio, tela cheia,
+// sem barra de endereço) tanto no PC quanto no celular.
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/static/sw.js').catch((e) => {
+      console.warn('Falha ao registrar service worker:', e);
+    });
+  });
+}
