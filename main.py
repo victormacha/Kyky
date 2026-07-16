@@ -38,6 +38,29 @@ Como rodar localmente pra testar:
     6. Cadastre-se primeiro -> você vira admin automaticamente
 
 Como colocar em produção (grátis): veja o README.md.
+
+----------------------------------------------------------------------
+ATUALIZAÇÃO (integração com o Agente Local / voz / controle físico do PC)
+----------------------------------------------------------------------
+Esta versão expande o que o Agente Local (agente_local.py, rodando no PC
+físico da Kyo no Windows) pode executar. A allowlist agora é dividida em
+duas partes:
+
+  - LOCAL_AGENT_SAFE_ACTIONS: ações que o agente executa IMEDIATAMENTE,
+    sem perguntar nada (abrir programas, ler/listar arquivos, rodar
+    código, etc). Continua sendo uma allowlist fixa - a Kyky nunca
+    inventa uma ação fora dela.
+  - LOCAL_AGENT_SENSITIVE_ACTIONS: ações que alteram/destroem algo ou
+    mexem no sistema de verdade (deletar, sobrescrever, mover, instalar,
+    desligar, comando livre). Essas SEMPRE são marcadas com
+    sensitive=true na fila; é o Agente Local quem mostra um popup de
+    confirmação na tela física da Kyo antes de rodar - o backend nunca
+    executa nada sozinho, só enfileira.
+
+Migração necessária no Postgres (rode uma vez no Supabase):
+
+    ALTER TABLE local_commands ADD COLUMN IF NOT EXISTS sensitive boolean DEFAULT false;
+
 """
 
 import os
@@ -71,35 +94,17 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "qwen/qwen3.6-27b")
-# Modelo mais leve, usado só como fallback automático quando o modelo
-# principal bate rate limit repetidamente. Modelos "instant"/8b costumam ter
-# limites de TPM bem mais folgados no tier gratuito da Groq, ao custo de
-# um pouco de qualidade de raciocínio.
 FALLBACK_MODEL = os.environ.get("GROQ_FALLBACK_MODEL", "llama-3.1-8b-instant")
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-SANDBOX_TIMEOUT_SECONDS = 10   # tempo máximo que um script pode rodar
-SANDBOX_OUTPUT_LIMIT = 4000    # trunca stdout/stderr muito longos
+SANDBOX_TIMEOUT_SECONDS = 10
+SANDBOX_OUTPUT_LIMIT = 4000
 
-# Quantas mensagens (usuário+assistente+tool, já contadas juntas) do
-# histórico são reenviadas pra Groq a cada turno. Sem isso, sessões longas
-# (principalmente com saídas de sandbox) estouram o limite de tokens por
-# minuto do tier gratuito (erro 429 rate_limit_exceeded).
 MAX_HISTORY_MESSAGES_SENT = 10
-
-# Tokens de saída reservados pra geração de tool calls grandes (ex: a Kyky
-# sugerindo um trecho de código extenso). Um valor alto demais aqui conta
-# contra o limite de tokens por minuto (TPM) mesmo que a resposta real seja
-# curta - por isso é moderado, não o máximo possível.
 MAX_TOKENS_WITH_TOOLS = 2048
-
-# Quantas vezes tentar de novo automaticamente quando a Groq responde 429
-# (rate limit), esperando o tempo que ela própria pede antes de tentar.
 GROQ_MAX_RETRIES = 2
 
-# Fonte de código do próprio projeto que a Kyky pode ler (ferramenta
-# ler_codigo_fonte). Fica travado nesta pasta - nunca fora dela.
 CODE_READ_ALLOWED_EXTENSIONS = {".py", ".md", ".txt", ".json", ".html", ".css", ".js"}
 CODE_READ_MAX_CHARS = 12000
 
@@ -113,18 +118,48 @@ CODE_READ_MAX_CHARS = 12000
 # injetar comandos na fila sem esse segredo.
 LOCAL_AGENT_TOKEN = os.environ.get("LOCAL_AGENT_TOKEN")
 
-# Allowlist FIXA de ações que o Agente Local pode executar. Nada de comando
-# livre/shell arbitrário - cada chave aqui é implementada como uma função
-# específica e segura dentro do agente_local.py. "argumento" só é usado
-# pelas ações que o exigem (ex: qual programa abrir), e é sempre validado
-# contra a própria allowlist de programas do agente, nunca executado cru.
-LOCAL_AGENT_ALLOWED_ACTIONS = {
-    "abrir_programa": "Abre um programa de uma lista pré-aprovada (ex: 'notepad', 'calculadora', 'navegador').",
+# Ações "seguras" - o Agente Local executa direto, sem confirmação.
+LOCAL_AGENT_SAFE_ACTIONS = {
+    "abrir_programa": "Abre um programa/app pelo nome ou caminho (ex: 'chrome', 'vscode', 'spotify', ou um caminho completo .exe).",
+    "abrir_arquivo": "Abre um arquivo existente com o programa padrão do Windows (double-click virtual).",
+    "abrir_url": "Abre uma URL no navegador padrão (só http/https).",
+    "listar_pasta": "Lista os arquivos e subpastas de um diretório (ex: 'C:/Users/kyo/Documents').",
+    "ler_arquivo": "Lê e retorna o conteúdo de um arquivo de texto/código já existente no PC.",
+    "pesquisar_arquivos": "Procura arquivos por nome/termo dentro de uma pasta (padrão: pasta do usuário).",
+    "criar_arquivo": (
+        "Cria um arquivo NOVO. Argumento em JSON: "
+        '{"caminho": "...", "conteudo": "..."}. Se o arquivo já existir, '
+        "vira ação sensível (sobrescrever_arquivo) automaticamente."
+    ),
+    "executar_codigo": (
+        "Executa um trecho de código Python direto no PC físico da Kyo (fora "
+        "de sandbox, com acesso real), pra criar e testar apps/scripts de verdade."
+    ),
     "status_sistema": "Retorna uso de CPU, memória RAM e disco no momento.",
     "travar_tela": "Bloqueia a tela do Windows (Win+L).",
     "volume_mudo": "Ativa/desativa o mudo do sistema.",
-    "abrir_url": "Abre uma URL no navegador padrão (só http/https).",
 }
+
+# Ações "sensíveis" - SEMPRE ficam marcadas com sensitive=true na fila. O
+# Agente Local mostra um popup de confirmação físico na tela da Kyo antes de
+# rodar qualquer uma delas, mesmo que a Kyky já tenha "decidido" fazer.
+LOCAL_AGENT_SENSITIVE_ACTIONS = {
+    "deletar_arquivo": "Apaga um arquivo existente (vai pra lixeira quando possível, não é permanente na hora).",
+    "sobrescrever_arquivo": (
+        'Sobrescreve o conteúdo de um arquivo já existente. Argumento JSON: '
+        '{"caminho": "...", "conteudo": "..."}.'
+    ),
+    "mover_arquivo": (
+        'Move ou renomeia um arquivo/pasta. Argumento JSON: '
+        '{"origem": "...", "destino": "..."}.'
+    ),
+    "instalar_programa": "Instala um programa ou pacote (ex: via winget ou pip).",
+    "desligar_pc": "Desliga o computador.",
+    "reiniciar_pc": "Reinicia o computador.",
+    "executar_comando": "Executa um comando de terminal arbitrário (uso livre, mais arriscado).",
+}
+
+LOCAL_AGENT_ALLOWED_ACTIONS = {**LOCAL_AGENT_SAFE_ACTIONS, **LOCAL_AGENT_SENSITIVE_ACTIONS}
 
 BASE_DIR = Path(__file__).parent
 STATIC_DIR = BASE_DIR / "static"
@@ -160,19 +195,25 @@ pedido for claro; confirme o que mudou depois.
 - ler_codigo_fonte: use pra ler um arquivo do seu próprio projeto (ex: \
 main.py) antes de propor ou testar uma melhoria, pra entender como o \
 sistema funciona de verdade em vez de supor.
-- testar_codigo: roda um trecho de Python num sandbox isolado, com \
-timeout, pra você validar se funciona antes de sugerir. Se der erro, \
-você pode ajustar e testar de novo antes de finalizar.
+- testar_codigo: roda um trecho de Python num sandbox isolado NO SERVIDOR \
+(nuvem), com timeout, pra você validar se funciona antes de sugerir. Se \
+der erro, você pode ajustar e testar de novo antes de finalizar.
 - sugerir_codigo: usada quando ela pedir uma nova funcionalidade pro seu \
 próprio sistema (o app Kyky). Isso NÃO aplica o código automaticamente - \
 só cria uma sugestão pendente que ela revisa no painel de admin. Prefira \
 usar ler_codigo_fonte e testar_codigo antes de sugerir, pra chegar com \
 algo já validado. Deixe claro pra ela quando usar.
-- controlar_pc: enfileira um comando pra ser executado no computador \
-físico da Kyo (só uma allowlist fixa de ações seguras: abrir um programa \
-conhecido, travar a tela, ver uso de CPU/memória, etc.). O comando só \
-roda quando o Agente Local dela buscar a fila e executar - não é \
-instantâneo nem tem acesso a nada fora da allowlist.
+- controlar_pc: enfileira uma ação pra ser executada no computador FÍSICO \
+da Kyo pelo Agente Local (um programa rodando no PC dela, com voz e \
+hotkey). Você pode abrir programas, ler/listar/criar arquivos, rodar \
+código Python de verdade nesse PC, ver status do sistema, travar a tela, \
+etc - tudo isso roda na hora, sem perguntar nada. Ações que alteram ou \
+destroem algo de verdade (deletar, sobrescrever, mover, instalar, \
+desligar/reiniciar, ou um comando de terminal livre) são sempre \
+marcadas como sensíveis: o Agente Local mostra um popup de confirmação \
+na tela física da Kyo antes de executar, então avise a ela que vai \
+precisar confirmar na hora. O comando só roda quando o Agente Local \
+buscar a fila (pode levar alguns segundos por causa do polling).
 """
 
 ADMIN_ADDENDUM = """
@@ -180,13 +221,18 @@ A pessoa falando com você agora é Kyo, sua criadora e administradora do \
 sistema. Reconheça isso naturalmente quando fizer sentido, sem ficar \
 repetindo. Kyo pode pedir detalhes técnicos mais profundos sobre como \
 você funciona, pedir para você ajustar sua própria personalidade, ou \
-sugerir código novo para o seu sistema.
+sugerir código novo para o seu sistema. Ela também pode estar falando \
+com você por voz, através do Agente Local no PC dela ou pelo celular - \
+nesses casos suas respostas podem ser lidas em voz alta, então prefira \
+frases mais diretas e naturais de se ouvir, sem abusar de listas longas \
+ou blocos de código extensos quando a resposta for por voz.
 """
 
 USER_ADDENDUM = """
 A pessoa falando com você agora é {username}, convidada por Kyo para \
 usar você. Trate com a mesma qualidade e cuidado, mas sem tratá-la como \
-administradora do sistema, e sem usar as ferramentas de autoedição.
+administradora do sistema, e sem usar as ferramentas de autoedição nem \
+controlar_pc.
 """
 
 DEFAULT_CONFIG = {
@@ -221,9 +267,7 @@ def now_iso() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Configuração editável (tabela app_config) - aqui vivem nome, notas de
-# personalidade, modelo e ícone. Isto é o que a autoedição/painel admin
-# alteram; o código-fonte nunca é tocado.
+# Configuração editável (tabela app_config)
 # ---------------------------------------------------------------------------
 
 def load_config() -> dict:
@@ -424,8 +468,9 @@ def build_system_prompt(user: dict, cfg: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Ferramentas (function calling) - autoedição segura + sugestões de código.
-# Só são oferecidas ao modelo quando quem fala é a administradora.
+# Ferramentas (function calling) - autoedição segura + sugestões de código +
+# controle do PC físico. Só são oferecidas ao modelo quando quem fala é a
+# administradora.
 # ---------------------------------------------------------------------------
 
 TOOLS_SCHEMA = [
@@ -489,10 +534,11 @@ TOOLS_SCHEMA = [
         "function": {
             "name": "testar_codigo",
             "description": (
-                "Executa um trecho de código Python num ambiente isolado, com "
-                "timeout, para você mesma validar se funciona antes de salvar "
-                "como sugestão. Não tem acesso a GROQ_API_KEY nem DATABASE_URL, "
-                "e é interrompido automaticamente após alguns segundos."
+                "Executa um trecho de código Python num ambiente isolado NO SERVIDOR "
+                "(nuvem), com timeout, para você mesma validar se funciona antes de "
+                "salvar como sugestão. Não tem acesso a GROQ_API_KEY nem DATABASE_URL, "
+                "e é interrompido automaticamente após alguns segundos. Diferente de "
+                "controlar_pc/executar_codigo, isso NÃO roda no PC físico da Kyo."
             ),
             "parameters": {
                 "type": "object",
@@ -534,12 +580,17 @@ TOOLS_SCHEMA = [
         "function": {
             "name": "controlar_pc",
             "description": (
-                "Enfileira um comando pra ser executado no computador físico da "
-                "administradora pelo Agente Local (um script rodando na máquina "
-                "dela). Só aceita ações de uma allowlist fixa e segura - nunca "
-                "comandos livres/shell arbitrário. O comando fica pendente até o "
-                "Agente Local buscar e executar (pode levar alguns segundos, por "
-                "causa do polling)."
+                "Enfileira uma ação pra ser executada no computador FÍSICO da "
+                "administradora pelo Agente Local (um programa rodando na máquina "
+                "dela, com voz e hotkey). Ações seguras (abrir programa/arquivo/url, "
+                "listar/ler/criar/pesquisar arquivos, executar código Python real, "
+                "status do sistema, travar tela, mudo) rodam na hora sem perguntar "
+                "nada. Ações sensíveis (deletar, sobrescrever, mover, instalar, "
+                "desligar/reiniciar, comando de terminal livre) SEMPRE pedem "
+                "confirmação num popup na tela física da Kyo antes de rodar - avise "
+                "a ela quando usar uma dessas. O comando fica pendente até o Agente "
+                "Local buscar e executar (pode levar alguns segundos, por causa do "
+                "polling)."
             ),
             "parameters": {
                 "type": "object",
@@ -547,14 +598,17 @@ TOOLS_SCHEMA = [
                     "acao": {
                         "type": "string",
                         "enum": sorted(LOCAL_AGENT_ALLOWED_ACTIONS.keys()),
-                        "description": "Qual ação executar (ver allowlist).",
+                        "description": "Qual ação executar (ver allowlist de seguras/sensíveis).",
                     },
                     "argumento": {
                         "type": "string",
                         "description": (
-                            "Argumento da ação, quando aplicável (ex: nome do "
-                            "programa para 'abrir_programa'). Deixe vazio se a "
-                            "ação não precisar de argumento."
+                            "Argumento da ação. Pra ações simples é uma string direta "
+                            "(ex: nome do programa, caminho, url, código). Pra ações "
+                            "que precisam de mais de um campo (criar_arquivo, "
+                            "sobrescrever_arquivo, mover_arquivo) é uma string JSON, "
+                            "ex: '{\"caminho\": \"C:/x.txt\", \"conteudo\": \"...\"}'. "
+                            "Deixe vazio se a ação não precisar de argumento."
                         ),
                     },
                 },
@@ -623,10 +677,17 @@ def execute_tool_call(name: str, args: dict, user: dict, cfg: dict) -> tuple[dic
         if acao not in LOCAL_AGENT_ALLOWED_ACTIONS:
             return cfg, f"Ação '{acao}' não está na allowlist permitida, nada foi enfileirado."
         cmd_id = enqueue_local_command(user["username"], acao, argumento)
+        sensitive = acao in LOCAL_AGENT_SENSITIVE_ACTIONS
+        aviso_confirmacao = (
+            " ⚠️ Essa é uma ação sensível - vai aparecer um popup de confirmação "
+            "na tela física da Kyo, e ela precisa confirmar por lá."
+            if sensitive
+            else ""
+        )
         return cfg, (
-            f"Comando '{acao}' enfileirado (id {cmd_id}) para o Agente Local. "
-            "Ele será executado assim que o agente fizer o próximo polling - "
-            "pode levar alguns segundos."
+            f"Comando '{acao}' enfileirado (id {cmd_id}) para o Agente Local."
+            f"{aviso_confirmacao} Ele será executado assim que o agente fizer o "
+            "próximo polling - pode levar alguns segundos."
         )
 
     return cfg, "Ferramenta desconhecida."
@@ -638,12 +699,13 @@ def execute_tool_call(name: str, args: dict, user: dict, cfg: dict) -> tuple[dic
 
 def enqueue_local_command(username: str, action: str, argument: str) -> str:
     cmd_id = str(uuid.uuid4())
+    sensitive = action in LOCAL_AGENT_SENSITIVE_ACTIONS
     with db() as conn:
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO local_commands (id, username, action, argument, status, created_at) "
-            "VALUES (%s, %s, %s, %s, 'pendente', %s)",
-            (cmd_id, username, action, argument, now_iso()),
+            "INSERT INTO local_commands (id, username, action, argument, status, sensitive, created_at) "
+            "VALUES (%s, %s, %s, %s, 'pendente', %s, %s)",
+            (cmd_id, username, action, argument, sensitive, now_iso()),
         )
     return cmd_id
 
@@ -670,7 +732,6 @@ def read_source_file(relative_path: str) -> str:
     if not relative_path or not relative_path.strip():
         return "Nenhum caminho de arquivo foi informado."
 
-    # Bloqueia de cara caminhos absolutos ou tentativas óbvias de escape.
     raw = relative_path.strip().lstrip("/\\")
     if ".." in Path(raw).parts:
         return "Acesso negado: caminhos com '..' não são permitidos."
@@ -682,7 +743,6 @@ def read_source_file(relative_path: str) -> str:
     except ValueError:
         return "Acesso negado: esse caminho está fora da pasta do projeto."
 
-    # Nunca ler segredos, mesmo que alguém tente (.env, chaves, etc.)
     blocked_names = {".env", ".env.local", "kyky.db"}
     if candidate.name in blocked_names or candidate.name.startswith("."):
         return "Acesso negado: este arquivo é reservado e não pode ser lido."
@@ -715,9 +775,6 @@ def call_groq(messages: list, model: str, tools: list | None = None) -> dict:
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
-        # Evita que a Groq corte a geração no meio do JSON de uma tool call
-        # grande (ex: sugerir_codigo com um trecho extenso), o que quebrava
-        # o parsing ("Failed to parse tool call arguments as JSON").
         payload["max_tokens"] = MAX_TOKENS_WITH_TOOLS
 
     attempt = 0
@@ -732,10 +789,6 @@ def call_groq(messages: list, model: str, tools: list | None = None) -> dict:
             return resp.json()
 
         if resp.status_code == 429 and attempt < GROQ_MAX_RETRIES:
-            # A própria Groq informa quantos segundos esperar, ex:
-            # "Please try again in 56.73s." - reaproveitamos isso em vez de
-            # simplesmente falhar. Um pequeno extra (+0.5s) evita cair bem
-            # em cima do limite de novo.
             wait_seconds = 3.0
             match = re.search(r"try again in ([\d.]+)s", resp.text)
             if match:
@@ -747,22 +800,18 @@ def call_groq(messages: list, model: str, tools: list | None = None) -> dict:
         if resp.status_code == 429:
             raise GroqRateLimitError(f"Groq {resp.status_code}: {resp.text}")
 
-        # mostra o motivo real que a Groq mandou, em vez de só "400 Bad Request"
         raise RuntimeError(f"Groq {resp.status_code}: {resp.text}")
 
 
 # ---------------------------------------------------------------------------
-# Sandbox — execução isolada de código Python, com timeout e sem segredos
+# Sandbox — execução isolada de código Python (NO SERVIDOR), com timeout e
+# sem segredos. Diferente da execução real no PC físico via Agente Local.
 # ---------------------------------------------------------------------------
 
 def run_sandbox_code(code: str, timeout: int = SANDBOX_TIMEOUT_SECONDS) -> dict:
-    """Executa um trecho de código Python isolado, com timeout, e sem
-    acesso às variáveis de ambiente sensíveis (GROQ_API_KEY, DATABASE_URL).
-    Não é isolamento de rede/contêiner de verdade (limitação do Render
-    free) — evita vazar segredos e travar o servidor, não mais que isso."""
     restricted_env = {
         k: v for k, v in os.environ.items()
-        if k not in {"GROQ_API_KEY", "DATABASE_URL"}
+        if k not in {"GROQ_API_KEY", "DATABASE_URL", "LOCAL_AGENT_TOKEN"}
     }
 
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -821,6 +870,12 @@ if not DATABASE_URL:
         "[AVISO] DATABASE_URL não definida. Configure a connection string "
         "do Supabase antes de rodar, ou nada será salvo."
     )
+if not LOCAL_AGENT_TOKEN:
+    print(
+        "[AVISO] LOCAL_AGENT_TOKEN não definida. O Agente Local (voz/controle "
+        "do PC físico) não vai conseguir se autenticar até você configurar "
+        "essa variável (aqui E no .env do agente_local.py, com o MESMO valor)."
+    )
 
 
 class RegisterRequest(BaseModel):
@@ -874,16 +929,17 @@ def config_public():
 # --- chat -------------------------------------------------------------------
 
 class Attachment(BaseModel):
-    type: str  # "image" ou "texto"
+    type: str
     name: str
-    data_url: str | None = None       # para imagens (data:...;base64,...)
-    extracted_text: str | None = None  # para pdf/texto
+    data_url: str | None = None
+    extracted_text: str | None = None
 
 
 class ChatRequest(BaseModel):
     session_id: str | None = None
     message: str
     attachments: list[Attachment] = []
+    source: str | None = None  # "web" | "voz" | "mobile" - só informativo por enquanto
 
 
 class ChatResponse(BaseModel):
@@ -900,7 +956,6 @@ def chat(req: ChatRequest, user: dict = Depends(user_from_token)):
     session_id = req.session_id or str(uuid.uuid4())
     history = load_history(user["username"], session_id)
 
-    # monta o conteúdo da mensagem do usuário, incluindo anexos
     text_content = req.message
     image_parts = []
     for att in req.attachments:
@@ -917,7 +972,6 @@ def chat(req: ChatRequest, user: dict = Depends(user_from_token)):
         user_content = text_content
         model_to_use = cfg.get("model", MODEL)
 
-    # o que fica salvo no histórico (mantém anexos pra re-exibir na UI)
     history.append({
         "role": "user",
         "content": user_content,
@@ -926,9 +980,6 @@ def chat(req: ChatRequest, user: dict = Depends(user_from_token)):
 
     system_prompt = build_system_prompt(user, cfg)
     groq_messages = [{"role": "system", "content": system_prompt}]
-    # Só reenvia as últimas N mensagens pra Groq (o histórico completo continua
-    # salvo no banco). Isso evita estourar o limite de tokens por minuto (429)
-    # em conversas longas, especialmente quando há saídas de sandbox no meio.
     recent_history = history[-MAX_HISTORY_MESSAGES_SENT:]
     for h in recent_history:
         content = h["content"]
@@ -941,16 +992,10 @@ def chat(req: ChatRequest, user: dict = Depends(user_from_token)):
     used_fallback = False
 
     def call_with_fallback(msgs: list) -> dict:
-        """Chama a Groq com o modelo atual; se ele bater rate limit mesmo
-        após as tentativas automáticas, cai pro FALLBACK_MODEL (mais leve,
-        com limites de tokens/minuto mais folgados no tier grátis) só nesta
-        conversa - não altera a preferência de modelo salva em config."""
         nonlocal model_to_use, used_fallback
         try:
             return call_groq(msgs, model_to_use, tools)
         except GroqRateLimitError:
-            # Não faz sentido cair pro fallback num pedido com imagem, já
-            # que o fallback de texto não teria como enxergar o anexo.
             if model_to_use == FALLBACK_MODEL or image_parts:
                 raise
             model_to_use = FALLBACK_MODEL
@@ -961,14 +1006,8 @@ def chat(req: ChatRequest, user: dict = Depends(user_from_token)):
         data = call_with_fallback(groq_messages)
         msg = data["choices"][0]["message"]
 
-        # loop simples de tool-calling (até 3 rodadas)
         rounds = 0
         while msg.get("tool_calls") and rounds < 3:
-            # A Groq manda content=null quando a mensagem só tem tool_calls.
-            # Reenviar null de volta faz alguns modelos rejeitarem com
-            # "messages[N].content must be a string" - então normalizamos
-            # pra string vazia antes de guardar essa mensagem no histórico
-            # da conversa com a API.
             safe_msg = dict(msg)
             if safe_msg.get("content") is None:
                 safe_msg["content"] = ""
@@ -979,11 +1018,6 @@ def chat(req: ChatRequest, user: dict = Depends(user_from_token)):
                 try:
                     fn_args = json.loads(call["function"]["arguments"] or "{}")
                 except json.JSONDecodeError:
-                    # O modelo gerou um JSON de argumentos inválido/incompleto
-                    # (comum quando o trecho de código sugerido é grande e a
-                    # geração é cortada). Em vez de seguir com argumentos
-                    # vazios silenciosamente, avisamos a Kyky pra ela tentar
-                    # de novo com um trecho menor ou dividido em partes.
                     groq_messages.append({
                         "role": "tool",
                         "tool_call_id": call["id"],
@@ -1144,7 +1178,6 @@ def admin_stats(_: dict = Depends(require_admin)):
         )
         active_7d = cur.fetchone()["c"]
 
-        # mensagens por dia, últimos 14 dias (aproximado por updated_at das sessões)
         cur.execute(
             "SELECT substr(CAST(updated_at AS TEXT), 1, 10) AS day, COALESCE(SUM(message_count),0) AS c "
             "FROM sessions GROUP BY day ORDER BY day DESC LIMIT 14"
@@ -1216,8 +1249,6 @@ async def admin_upload_icon(file: UploadFile = File(...), _: dict = Depends(requ
     elif "webp" in content_type:
         ext = ".webp"
 
-    # AVISO: isto ainda salva em disco local, que é apagado em reinícios do
-    # Render. Para persistir o ícone de verdade, migre para Supabase Storage.
     icon_path = STATIC_DIR / f"icon{ext}"
     icon_path.write_bytes(raw)
 
@@ -1283,17 +1314,19 @@ def admin_run_sandbox(req: SandboxRunRequest, _: dict = Depends(require_admin)):
 
 
 class LocalCommandResult(BaseModel):
-    status: str  # 'concluido' ou 'falhou'
+    status: str  # 'concluido', 'falhou' ou 'recusado' (usuário negou a confirmação)
     result: str
 
 
 @app.get("/agent/commands/pending")
 def agent_pending_commands(_: None = Depends(require_local_agent)):
-    """Chamado pelo Agente Local via polling (não pelo navegador/admin)."""
+    """Chamado pelo Agente Local via polling (não pelo navegador/admin).
+    Inclui a flag 'sensitive' pra o agente decidir se mostra o popup de
+    confirmação antes de executar."""
     with db() as conn:
         cur = conn.cursor()
         cur.execute(
-            "SELECT id, action, argument FROM local_commands "
+            "SELECT id, action, argument, sensitive FROM local_commands "
             "WHERE status = 'pendente' ORDER BY created_at ASC LIMIT 5"
         )
         return [dict(r) for r in cur.fetchall()]
@@ -1301,8 +1334,8 @@ def agent_pending_commands(_: None = Depends(require_local_agent)):
 
 @app.post("/agent/commands/{cmd_id}/result")
 def agent_report_result(cmd_id: str, req: LocalCommandResult, _: None = Depends(require_local_agent)):
-    """O Agente Local chama isso depois de executar (ou tentar executar)."""
-    if req.status not in ("concluido", "falhou"):
+    """O Agente Local chama isso depois de executar (ou recusar/tentar)."""
+    if req.status not in ("concluido", "falhou", "recusado"):
         raise HTTPException(status_code=400, detail="Status inválido.")
     with db() as conn:
         cur = conn.cursor()
@@ -1319,7 +1352,7 @@ def admin_list_local_commands(_: dict = Depends(require_admin)):
     with db() as conn:
         cur = conn.cursor()
         cur.execute(
-            "SELECT id, username, action, argument, status, result, created_at, completed_at "
+            "SELECT id, username, action, argument, sensitive, status, result, created_at, completed_at "
             "FROM local_commands ORDER BY created_at DESC LIMIT 100"
         )
         return [dict(r) for r in cur.fetchall()]
