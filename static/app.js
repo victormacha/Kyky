@@ -313,6 +313,20 @@ function addMessage({ who, text, attachments = [], pending = false }) {
       img.className = 'attachment-img-preview';
       img.src = att.data_url;
       bubble.appendChild(img);
+    } else if (att.type === 'audio' && att.data_url) {
+      const wrap = document.createElement('div');
+      wrap.className = 'attachment-audio';
+      const player = document.createElement('audio');
+      player.controls = true;
+      player.src = att.data_url;
+      wrap.appendChild(player);
+      if (att.extracted_text) {
+        const transcript = document.createElement('div');
+        transcript.className = 'attachment-audio-transcript';
+        transcript.textContent = '🎙️ ' + att.extracted_text;
+        wrap.appendChild(transcript);
+      }
+      bubble.appendChild(wrap);
     } else if (att.type === 'texto') {
       const chip = document.createElement('div');
       chip.className = 'attachment-chip';
@@ -409,31 +423,75 @@ async function loadHistory() {
 
 const attachInput = $('#attachInput');
 $('#attachBtn').addEventListener('click', () => attachInput.click());
+attachInput.setAttribute('accept', 'image/*,.pdf,.txt,.md,.csv,audio/*');
+
+async function uploadAndQueue(file) {
+  if (file.size > 15 * 1024 * 1024) {
+    alert(`"${file.name}" é maior que 15MB.`);
+    return;
+  }
+  const formData = new FormData();
+  formData.append('file', file);
+  try {
+    const res = await fetch('/upload', { method: 'POST', headers: authHeaders(), body: formData });
+    const data = await res.json();
+    if (!res.ok) {
+      alert(data.detail || 'Erro ao enviar arquivo.');
+      return;
+    }
+    pendingAttachments.push(data);
+    renderPendingAttachments();
+  } catch (e) {
+    alert('Erro de conexão ao enviar arquivo.');
+  }
+}
 
 attachInput.addEventListener('change', async () => {
   const files = Array.from(attachInput.files || []);
   attachInput.value = '';
   for (const file of files) {
-    if (file.size > 15 * 1024 * 1024) {
-      alert(`"${file.name}" é maior que 15MB.`);
-      continue;
-    }
-    const formData = new FormData();
-    formData.append('file', file);
-    try {
-      const res = await fetch('/upload', { method: 'POST', headers: authHeaders(), body: formData });
-      const data = await res.json();
-      if (!res.ok) {
-        alert(data.detail || 'Erro ao enviar arquivo.');
-        continue;
-      }
-      pendingAttachments.push(data);
-      renderPendingAttachments();
-    } catch (e) {
-      alert('Erro de conexão ao enviar arquivo.');
-    }
+    await uploadAndQueue(file);
   }
 });
+
+// ---------- Gravação de áudio (microfone do navegador) ----------
+
+const micBtn = $('#micBtn');
+let mediaRecorder = null;
+let recordedChunks = [];
+let isRecording = false;
+
+if (micBtn) {
+  micBtn.addEventListener('click', async () => {
+    if (!isRecording) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        recordedChunks = [];
+        mediaRecorder = new MediaRecorder(stream);
+        mediaRecorder.ondataavailable = (e) => {
+          if (e.data.size > 0) recordedChunks.push(e.data);
+        };
+        mediaRecorder.onstop = async () => {
+          stream.getTracks().forEach((t) => t.stop());
+          const blob = new Blob(recordedChunks, { type: 'audio/webm' });
+          const file = new File([blob], `gravacao-${Date.now()}.webm`, { type: 'audio/webm' });
+          micBtn.classList.remove('recording');
+          micBtn.textContent = '🎤';
+          await uploadAndQueue(file);
+        };
+        mediaRecorder.start();
+        isRecording = true;
+        micBtn.classList.add('recording');
+        micBtn.textContent = '⏹';
+      } catch (e) {
+        alert('Não consegui acessar o microfone: ' + e.message);
+      }
+    } else {
+      mediaRecorder.stop();
+      isRecording = false;
+    }
+  });
+}
 
 function renderPendingAttachments() {
   const wrap = $('#pendingAttachments');
@@ -445,6 +503,10 @@ function renderPendingAttachments() {
       const img = document.createElement('img');
       img.src = att.data_url;
       chip.appendChild(img);
+    } else if (att.type === 'audio') {
+      const icon = document.createElement('span');
+      icon.textContent = '🎤';
+      chip.appendChild(icon);
     }
     const label = document.createElement('span');
     label.textContent = att.name.length > 20 ? att.name.slice(0, 18) + '…' : att.name;
@@ -459,7 +521,7 @@ function renderPendingAttachments() {
   });
 }
 
-// ============================================================================
+      // ============================================================================
 // Painel de administração
 // ============================================================================
 
@@ -727,4 +789,4 @@ if ('serviceWorker' in navigator) {
       console.warn('Falha ao registrar service worker:', e);
     });
   });
-}
+  }
