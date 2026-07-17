@@ -57,10 +57,51 @@ duas partes:
     confirmação na tela física da Kyo antes de rodar - o backend nunca
     executa nada sozinho, só enfileira.
 
-Migração necessária no Postgres (rode uma vez no Supabase):
+Migração necessária no Postgres (rode uma vez no Supabase da Kyky):
 
     ALTER TABLE local_commands ADD COLUMN IF NOT EXISTS sensitive boolean DEFAULT false;
 
+----------------------------------------------------------------------
+ATUALIZAÇÃO (integração federada com o Nexus - app de tarefas em equipe)
+----------------------------------------------------------------------
+O Nexus (desktop + mobile) é um app SEPARADO, com seu próprio projeto
+Supabase (NEXUS_DATABASE_URL), tabelas próprias (usuarios/tarefas/
+grupos/notificacoes) e seu próprio esquema de senha (sha256 simples).
+A Kyky NÃO se torna dona desse banco - ela só lê/escreve nas mesmas
+tabelas que o app Nexus já usa, como mais um "cliente".
+
+Como funciona o login federado:
+  1. A pessoa tenta logar na Kyky com o MESMO usuário/senha do Nexus.
+  2. Se não existir conta local na Kyky com esse username, a Kyky tenta
+     validar login+senha contra a tabela `usuarios` do Nexus.
+  3. Se bater, a Kyky cria uma conta local automaticamente (usando seu
+     próprio esquema de hash, mais forte) e grava um vínculo na tabela
+     `nexus_links`, guardando o id/nivel/grupo do Nexus.
+  4. Regra de segurança: SÓ nivel="nexus" no Nexus vira role="admin" na
+     Kyky. "adm" (líder de equipe) e "membro" viram role="user" comum -
+     eles NÃO ganham acesso a controlar_pc, atualizar_personalidade,
+     sugerir_codigo, etc. só por serem líderes de equipe no Nexus.
+  5. Uma vez vinculada, a conta usa normalmente a senha da Kyky daqui
+     pra frente (não repete a checagem contra o Nexus a cada login).
+
+Ferramentas novas (nexus_*): disponíveis pra QUALQUER usuário vinculado
+ao Nexus (não só admin), mas sempre respeitando o escopo do nivel dele
+lá (membro só vê o que é dele, adm vê o grupo, nexus vê tudo) - a Kyky
+nunca deixa um membro comum listar ou mexer em tarefas de outra pessoa.
+
+Migração necessária no Postgres da Kyky (rode uma vez no Supabase dela):
+
+    CREATE TABLE IF NOT EXISTS nexus_links (
+        username_kyky   text PRIMARY KEY REFERENCES users(username) ON DELETE CASCADE,
+        nexus_usuario_id text NOT NULL,
+        nivel           text NOT NULL,
+        grupo_id        text,
+        grupo_nome      text,
+        linked_at       text NOT NULL
+    );
+
+Variáveis de ambiente novas:
+    NEXUS_DATABASE_URL="postgresql://...supabase.co:6543/postgres"  # projeto do Nexus
 """
 
 import os
@@ -97,6 +138,11 @@ VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "qwen/qwen3.6-27b")
 FALLBACK_MODEL = os.environ.get("GROQ_FALLBACK_MODEL", "llama-3.1-8b-instant")
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
+
+# Projeto Supabase SEPARADO do app Nexus (tarefas em equipe). Opcional: se
+# não for configurado, a integração federada e as ferramentas nexus_* ficam
+# simplesmente desativadas, sem quebrar nada do resto da Kyky.
+NEXUS_DATABASE_URL = os.environ.get("NEXUS_DATABASE_URL")
 
 SANDBOX_TIMEOUT_SECONDS = 10
 SANDBOX_OUTPUT_LIMIT = 4000
@@ -233,6 +279,14 @@ marcadas como sensíveis: o Agente Local mostra um popup de confirmação \
 na tela física da Kyo antes de executar, então avise a ela que vai \
 precisar confirmar na hora. O comando só roda quando o Agente Local \
 buscar a fila (pode levar alguns segundos por causa do polling).
+
+Se a pessoa estiver vinculada ao Nexus (app de tarefas em equipe), você \
+também tem ferramentas nexus_criar_tarefa, nexus_listar_tarefas, \
+nexus_concluir_tarefa e nexus_resumo_pendencias. Elas sempre respeitam o \
+nível dela no Nexus: um membro comum só vê/mexe nas próprias tarefas, um \
+admin de equipe vê o grupo dele, e só quem é "nexus" lá vê tudo. Nunca \
+liste ou altere tarefas de outra pessoa fora desse escopo, mesmo que \
+pedido - explique que não tem permissão pra isso.
 """
 
 ADMIN_ADDENDUM = """
@@ -254,6 +308,12 @@ administradora do sistema, e sem usar as ferramentas de autoedição nem \
 controlar_pc.
 """
 
+NEXUS_LINK_ADDENDUM = """
+{username} está vinculada(o) ao Nexus (app de tarefas em equipe) como \
+nível "{nivel}"{grupo_txt}. Use as ferramentas nexus_* pra ajudar com \
+tarefas e pendências dela(e), sempre dentro desse escopo de permissão.
+"""
+
 DEFAULT_CONFIG = {
     "ai_name": DEFAULT_AI_NAME,
     "personality_notes": "",
@@ -263,7 +323,7 @@ DEFAULT_CONFIG = {
 
 
 # ---------------------------------------------------------------------------
-# Banco de dados (Postgres / Supabase)
+# Banco de dados (Postgres / Supabase) - projeto da Kyky
 # ---------------------------------------------------------------------------
 
 @contextmanager
@@ -271,6 +331,28 @@ def db():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL não configurada.")
     conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Banco de dados (Postgres / Supabase) - projeto SEPARADO do Nexus. Usado
+# só pra login federado e pelas ferramentas nexus_*; a Kyky nunca escreve
+# nada fora das tabelas que o próprio app Nexus já usa (usuarios, tarefas,
+# grupos, notificacoes).
+# ---------------------------------------------------------------------------
+
+@contextmanager
+def nexus_db():
+    if not NEXUS_DATABASE_URL:
+        raise RuntimeError("NEXUS_DATABASE_URL não configurada - integração com o Nexus está desativada.")
+    conn = psycopg2.connect(NEXUS_DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
     try:
         yield conn
         conn.commit()
@@ -320,12 +402,24 @@ def hash_password(password: str, salt: str) -> str:
     return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 200_000).hex()
 
 
-def create_user(username: str, password: str) -> str:
+def local_user_exists(username: str) -> bool:
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM users WHERE username = %s", (username,))
+        return cur.fetchone() is not None
+
+
+def create_user(username: str, password: str, forced_role: str | None = None) -> str:
+    """Cria uma conta local na Kyky. Por padrão a primeira pessoa a se
+    cadastrar vira admin (comportamento original). `forced_role` é usado
+    pelo login federado do Nexus, pra decidir o papel com base no nível
+    dela lá (ver verify_login_federado_nexus mais abaixo) em vez dessa
+    regra de "primeira conta"."""
     with db() as conn:
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) AS c FROM users")
         existing_count = cur.fetchone()["c"]
-        role = "admin" if existing_count == 0 else "user"
+        role = forced_role if forced_role is not None else ("admin" if existing_count == 0 else "user")
 
         salt = secrets.token_hex(16)
         pw_hash = hash_password(password, salt)
@@ -381,6 +475,84 @@ def require_admin(user: dict = Depends(user_from_token)) -> dict:
     if user["role"] != "admin":
         raise HTTPException(status_code=403, detail="Só o administrador pode fazer isso.")
     return user
+
+
+# ---------------------------------------------------------------------------
+# Integração federada com o Nexus - login e vínculo de conta
+# ---------------------------------------------------------------------------
+
+def verify_nexus_login(username: str, password: str) -> dict | None:
+    """Verifica login/senha contra a tabela `usuarios` do Nexus, usando o
+    MESMO esquema de hash que o app Nexus usa (sha256 simples, sem salt -
+    é assim que o Nexus armazena hoje, não é a Kyky quem escolhe isso).
+    Devolve o registro do usuário do Nexus (com grupo, se houver) ou None
+    se não bater ou a integração estiver desativada."""
+    if not NEXUS_DATABASE_URL:
+        return None
+    senha_hash = hashlib.sha256(password.encode()).hexdigest()
+    with nexus_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT u.id, u.nome, u.login, u.nivel, u.grupo_id, g.nome AS grupo_nome "
+            "FROM usuarios u LEFT JOIN grupos g ON g.id = u.grupo_id "
+            "WHERE u.login = %s AND u.senha = %s",
+            (username, senha_hash),
+        )
+        return cur.fetchone()
+
+
+def save_nexus_link(username_kyky: str, nexus_user: dict) -> None:
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO nexus_links (username_kyky, nexus_usuario_id, nivel, grupo_id, grupo_nome, linked_at)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (username_kyky) DO UPDATE
+            SET nexus_usuario_id = EXCLUDED.nexus_usuario_id,
+                nivel = EXCLUDED.nivel,
+                grupo_id = EXCLUDED.grupo_id,
+                grupo_nome = EXCLUDED.grupo_nome
+            """,
+            (
+                username_kyky,
+                str(nexus_user["id"]),
+                nexus_user["nivel"],
+                str(nexus_user["grupo_id"]) if nexus_user.get("grupo_id") else None,
+                nexus_user.get("grupo_nome"),
+                now_iso(),
+            ),
+        )
+
+
+def load_nexus_link(username_kyky: str) -> dict | None:
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT nexus_usuario_id, nivel, grupo_id, grupo_nome FROM nexus_links WHERE username_kyky = %s",
+            (username_kyky,),
+        )
+        return cur.fetchone()
+
+
+def login_com_federacao_nexus(username: str, password: str) -> tuple[str, dict | None]:
+    """Tenta o login local normal da Kyky primeiro. Se a conta local não
+    existir, tenta validar contra o Nexus e, se bater, provisiona a conta
+    local automaticamente (role definido pelo nível do Nexus - só
+    nivel="nexus" vira admin da Kyky). Devolve (role, nexus_link_ou_None)."""
+    if local_user_exists(username):
+        role = verify_login(username, password)
+        return role, load_nexus_link(username)
+
+    nexus_user = verify_nexus_login(username, password)
+    if nexus_user is None:
+        # nem existe local nem bate no Nexus -> credenciais inválidas mesmo
+        raise HTTPException(status_code=401, detail="Usuário ou senha inválidos.")
+
+    forced_role = "admin" if nexus_user["nivel"] == "nexus" else "user"
+    create_user(username, password, forced_role=forced_role)
+    save_nexus_link(username, nexus_user)
+    return forced_role, load_nexus_link(username)
 
 
 # ---------------------------------------------------------------------------
@@ -477,22 +649,31 @@ def delete_history(username: str, session_id: str) -> None:
         )
 
 
-def build_system_prompt(user: dict, cfg: dict) -> str:
+def build_system_prompt(user: dict, cfg: dict, nexus_link: dict | None) -> str:
     base = BASE_PERSONALITY_TEMPLATE.format(ai_name=cfg["ai_name"])
     if cfg.get("personality_notes"):
         base += f"\nNotas de personalidade adicionadas por autoedição/admin:\n{cfg['personality_notes']}\n"
     if user["role"] == "admin":
-        return base + ADMIN_ADDENDUM
-    return base + USER_ADDENDUM.format(username=user["username"])
+        base += ADMIN_ADDENDUM
+    else:
+        base += USER_ADDENDUM.format(username=user["username"])
+    if nexus_link:
+        grupo_txt = f", do grupo \"{nexus_link['grupo_nome']}\"" if nexus_link.get("grupo_nome") else ""
+        base += NEXUS_LINK_ADDENDUM.format(
+            username=user["username"], nivel=nexus_link["nivel"], grupo_txt=grupo_txt
+        )
+    return base
 
 
 # ---------------------------------------------------------------------------
 # Ferramentas (function calling) - autoedição segura + sugestões de código +
-# controle do PC físico. Só são oferecidas ao modelo quando quem fala é a
-# administradora.
+# controle do PC físico + integração com o Nexus. As de autoedição/PC só são
+# oferecidas quando quem fala é a administradora; as nexus_* são oferecidas
+# pra qualquer usuário com um vínculo (nexus_links) salvo, respeitando o
+# escopo do nível dele lá.
 # ---------------------------------------------------------------------------
 
-TOOLS_SCHEMA = [
+ADMIN_TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
@@ -555,9 +736,10 @@ TOOLS_SCHEMA = [
             "description": (
                 "Executa um trecho de código Python num ambiente isolado NO SERVIDOR "
                 "(nuvem), com timeout, para você mesma validar se funciona antes de "
-                "salvar como sugestão. Não tem acesso a GROQ_API_KEY nem DATABASE_URL, "
-                "e é interrompido automaticamente após alguns segundos. Diferente de "
-                "controlar_pc/executar_codigo, isso NÃO roda no PC físico da Kyo."
+                "salvar como sugestão. Não tem acesso a GROQ_API_KEY, DATABASE_URL nem "
+                "NEXUS_DATABASE_URL, e é interrompido automaticamente após alguns "
+                "segundos. Diferente de controlar_pc/executar_codigo, isso NÃO roda no "
+                "PC físico da Kyo."
             ),
             "parameters": {
                 "type": "object",
@@ -637,8 +819,265 @@ TOOLS_SCHEMA = [
     },
 ]
 
+# Ferramentas do Nexus - liberadas pra qualquer usuário com vínculo salvo em
+# nexus_links, independente de ser admin da Kyky ou não. O escopo real
+# (o que ela pode ver/alterar) é sempre decidido em execute_tool_call com
+# base no nível/grupo do vínculo, nunca confiando só no que o modelo pediu.
+NEXUS_TOOLS_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "nexus_listar_tarefas",
+            "description": (
+                "Lista tarefas do Nexus (app de tarefas em equipe) dentro do escopo "
+                "de permissão da pessoa: membro comum só vê as tarefas atribuídas a "
+                "ele mesmo; admin de equipe vê as do grupo dele; nível 'nexus' vê "
+                "todas. Use pra responder perguntas tipo 'o que eu tenho pendente' "
+                "ou 'quais tarefas estão atrasadas'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["pendentes", "concluidas", "todas"],
+                        "description": "Filtro de status. Padrão: pendentes.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "nexus_criar_tarefa",
+            "description": (
+                "Cria uma nova tarefa no Nexus, atribuída a alguém. Membro comum só "
+                "pode criar tarefa pra si mesmo; admin de equipe pode atribuir a "
+                "qualquer pessoa do próprio grupo; nível 'nexus' pode atribuir a "
+                "qualquer pessoa. Dispara notificação pro responsável automaticamente, "
+                "igual o app Nexus já faz quando alguém cria por lá."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "titulo": {"type": "string", "description": "Título da tarefa."},
+                    "descricao": {"type": "string", "description": "Descrição (opcional)."},
+                    "responsavel_login": {
+                        "type": "string",
+                        "description": (
+                            "Login do Nexus da pessoa responsável. Se vazio, assume a "
+                            "própria pessoa que está falando com você."
+                        ),
+                    },
+                    "data_prazo": {
+                        "type": "string",
+                        "description": "Data no formato YYYY-MM-DD.",
+                    },
+                    "horario": {
+                        "type": "string",
+                        "description": "Horário HH:MM, ou vazio para 'dia todo'.",
+                    },
+                },
+                "required": ["titulo", "data_prazo"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "nexus_concluir_tarefa",
+            "description": (
+                "Marca uma tarefa do Nexus como concluída, pelo título (busca "
+                "aproximada dentro do escopo permitido) ou pelo id exato."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "titulo_ou_id": {
+                        "type": "string",
+                        "description": "Título (ou parte dele) ou id da tarefa a concluir.",
+                    },
+                },
+                "required": ["titulo_ou_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "nexus_resumo_pendencias",
+            "description": (
+                "Monta um resumo rápido (em texto corrido, bom pra ler em voz alta) "
+                "das tarefas pendentes e vencidas de hoje, dentro do escopo da "
+                "pessoa. Use quando ela pedir um resumo do dia ou 'o que eu tenho pra "
+                "fazer hoje'."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+]
 
-def execute_tool_call(name: str, args: dict, user: dict, cfg: dict) -> tuple[dict, str]:
+
+def tools_for_user(user: dict, nexus_link: dict | None) -> list | None:
+    tools = []
+    if user["role"] == "admin":
+        tools += ADMIN_TOOLS_SCHEMA
+    if nexus_link:
+        tools += NEXUS_TOOLS_SCHEMA
+    return tools or None
+
+
+# --- implementação das ferramentas nexus_* ----------------------------------
+
+def _nexus_escopo_tarefas(cur, nexus_link: dict):
+    """Devolve uma cláusula SQL (string) + params que restringem a consulta
+    de tarefas ao escopo do nível da pessoa. Nunca confia em nada vindo do
+    modelo - o escopo é sempre derivado do nexus_link salvo no banco."""
+    nivel = nexus_link["nivel"]
+    if nivel == "nexus":
+        return "TRUE", []
+    if nivel == "adm" and nexus_link.get("grupo_id"):
+        cur.execute("SELECT id FROM usuarios WHERE grupo_id = %s", (nexus_link["grupo_id"],))
+        ids = [str(r["id"]) for r in cur.fetchall()]
+        if not ids:
+            return "FALSE", []
+        return "t.atribuido_a::text = ANY(%s)", [ids]
+    # membro comum (ou adm sem grupo) só vê o que é dele mesmo
+    return "t.atribuido_a::text = %s", [nexus_link["nexus_usuario_id"]]
+
+
+def nexus_tool_listar_tarefas(nexus_link: dict, status: str = "pendentes") -> str:
+    with nexus_db() as conn:
+        cur = conn.cursor()
+        escopo_sql, escopo_params = _nexus_escopo_tarefas(cur, nexus_link)
+        filtro_status = ""
+        if status == "pendentes":
+            filtro_status = "AND t.concluida = FALSE"
+        elif status == "concluidas":
+            filtro_status = "AND t.concluida = TRUE"
+        cur.execute(
+            f"""
+            SELECT t.titulo, t.data_prazo, t.horario, t.concluida, r.nome AS responsavel
+            FROM tarefas t
+            LEFT JOIN usuarios r ON r.id = t.atribuido_a
+            WHERE {escopo_sql} {filtro_status}
+            ORDER BY t.data_prazo ASC
+            LIMIT 30
+            """,
+            escopo_params,
+        )
+        rows = cur.fetchall()
+    if not rows:
+        return "Nenhuma tarefa encontrada nesse filtro."
+    linhas = []
+    for r in rows:
+        h = f" às {str(r['horario'])[:5]}" if r["horario"] else " (dia todo)"
+        marca = "✅" if r["concluida"] else "⏳"
+        linhas.append(f"{marca} {r['titulo']} — {r['data_prazo']}{h} — responsável: {r['responsavel']}")
+    return "\n".join(linhas)
+
+
+def nexus_tool_criar_tarefa(
+    nexus_link: dict, titulo: str, data_prazo: str, descricao: str = "",
+    responsavel_login: str = "", horario: str = "",
+) -> str:
+    with nexus_db() as conn:
+        cur = conn.cursor()
+        nivel = nexus_link["nivel"]
+
+        if responsavel_login:
+            cur.execute("SELECT id, nome, grupo_id FROM usuarios WHERE login = %s", (responsavel_login,))
+            alvo = cur.fetchone()
+            if not alvo:
+                return f"Não encontrei nenhum usuário do Nexus com login '{responsavel_login}'."
+        else:
+            cur.execute("SELECT id, nome, grupo_id FROM usuarios WHERE id = %s", (nexus_link["nexus_usuario_id"],))
+            alvo = cur.fetchone()
+
+        # trava de escopo: membro só cria pra si mesmo; adm só dentro do
+        # próprio grupo; nexus pode qualquer um.
+        if nivel == "membro" and str(alvo["id"]) != str(nexus_link["nexus_usuario_id"]):
+            return "Você só tem permissão pra criar tarefas pra você mesma(o) no Nexus."
+        if nivel == "adm" and str(alvo.get("grupo_id")) != str(nexus_link.get("grupo_id")):
+            return "Você só tem permissão pra criar tarefas pra pessoas do seu próprio grupo no Nexus."
+
+        horario_sql = f"{horario}:00" if horario else None
+        cur.execute(
+            """
+            INSERT INTO tarefas (titulo, descricao, criado_por, atribuido_a, data_prazo, horario, concluida)
+            VALUES (%s, %s, %s, %s, %s, %s, FALSE)
+            RETURNING id
+            """,
+            (titulo, descricao, nexus_link["nexus_usuario_id"], alvo["id"], data_prazo, horario_sql),
+        )
+        nova_id = cur.fetchone()["id"]
+
+        if str(alvo["id"]) != str(nexus_link["nexus_usuario_id"]):
+            h_info = f" às {horario}" if horario else " (dia todo)"
+            cur.execute(
+                "INSERT INTO notificacoes (usuario_id, titulo, mensagem, lida) VALUES (%s, %s, %s, FALSE)",
+                (
+                    alvo["id"],
+                    "📋 Nova Tarefa Atribuída",
+                    f"Você recebeu (via Kyky): {titulo} — {data_prazo}{h_info}",
+                ),
+            )
+    return f"Tarefa '{titulo}' criada para {alvo['nome']} em {data_prazo}."
+
+
+def nexus_tool_concluir_tarefa(nexus_link: dict, titulo_ou_id: str) -> str:
+    with nexus_db() as conn:
+        cur = conn.cursor()
+        escopo_sql, escopo_params = _nexus_escopo_tarefas(cur, nexus_link)
+        cur.execute(
+            f"""
+            SELECT t.id, t.titulo FROM tarefas t
+            WHERE {escopo_sql} AND t.concluida = FALSE
+            AND (t.id::text = %s OR t.titulo ILIKE %s)
+            ORDER BY t.data_prazo ASC
+            LIMIT 1
+            """,
+            escopo_params + [titulo_ou_id, f"%{titulo_ou_id}%"],
+        )
+        alvo = cur.fetchone()
+        if not alvo:
+            return "Não encontrei nenhuma tarefa pendente com esse título/id dentro do que você tem permissão de ver."
+        cur.execute("UPDATE tarefas SET concluida = TRUE WHERE id = %s", (alvo["id"],))
+    return f"Tarefa '{alvo['titulo']}' marcada como concluída."
+
+
+def nexus_tool_resumo_pendencias(nexus_link: dict) -> str:
+    with nexus_db() as conn:
+        cur = conn.cursor()
+        escopo_sql, escopo_params = _nexus_escopo_tarefas(cur, nexus_link)
+        hoje = datetime.now(timezone.utc).date().isoformat()
+        cur.execute(
+            f"""
+            SELECT t.titulo, t.data_prazo, t.horario, r.nome AS responsavel
+            FROM tarefas t
+            LEFT JOIN usuarios r ON r.id = t.atribuido_a
+            WHERE {escopo_sql} AND t.concluida = FALSE AND t.data_prazo <= %s
+            ORDER BY t.data_prazo ASC
+            LIMIT 20
+            """,
+            escopo_params + [hoje],
+        )
+        rows = cur.fetchall()
+    if not rows:
+        return "Nenhuma pendência hoje ou atrasada dentro do que você pode ver. Tudo em dia!"
+    vencidas = [r for r in rows if r["data_prazo"] < hoje]
+    de_hoje = [r for r in rows if r["data_prazo"] == hoje]
+    partes = []
+    if vencidas:
+        partes.append(f"{len(vencidas)} tarefa(s) vencida(s): " + "; ".join(v["titulo"] for v in vencidas))
+    if de_hoje:
+        partes.append(f"{len(de_hoje)} tarefa(s) pra hoje: " + "; ".join(v["titulo"] for v in de_hoje))
+    return " | ".join(partes)
+
+
+def execute_tool_call(name: str, args: dict, user: dict, cfg: dict, nexus_link: dict | None) -> tuple[dict, str]:
     """Executa a ferramenta e retorna (config_atualizado, texto_resultado)."""
     if name == "atualizar_personalidade":
         campo = args.get("campo")
@@ -708,6 +1147,26 @@ def execute_tool_call(name: str, args: dict, user: dict, cfg: dict) -> tuple[dic
             f"{aviso_confirmacao} Ele será executado assim que o agente fizer o "
             "próximo polling - pode levar alguns segundos."
         )
+
+    # --- ferramentas do Nexus - todas exigem vínculo salvo ---
+    if name.startswith("nexus_"):
+        if not nexus_link:
+            return cfg, "Essa pessoa não está vinculada ao Nexus, não é possível usar essa ferramenta."
+        if name == "nexus_listar_tarefas":
+            return cfg, nexus_tool_listar_tarefas(nexus_link, args.get("status", "pendentes"))
+        if name == "nexus_criar_tarefa":
+            return cfg, nexus_tool_criar_tarefa(
+                nexus_link,
+                titulo=args.get("titulo", ""),
+                data_prazo=args.get("data_prazo", ""),
+                descricao=args.get("descricao", ""),
+                responsavel_login=args.get("responsavel_login", ""),
+                horario=args.get("horario", ""),
+            )
+        if name == "nexus_concluir_tarefa":
+            return cfg, nexus_tool_concluir_tarefa(nexus_link, args.get("titulo_ou_id", ""))
+        if name == "nexus_resumo_pendencias":
+            return cfg, nexus_tool_resumo_pendencias(nexus_link)
 
     return cfg, "Ferramenta desconhecida."
 
@@ -830,7 +1289,7 @@ def call_groq(messages: list, model: str, tools: list | None = None) -> dict:
 def run_sandbox_code(code: str, timeout: int = SANDBOX_TIMEOUT_SECONDS) -> dict:
     restricted_env = {
         k: v for k, v in os.environ.items()
-        if k not in {"GROQ_API_KEY", "DATABASE_URL", "LOCAL_AGENT_TOKEN"}
+        if k not in {"GROQ_API_KEY", "DATABASE_URL", "NEXUS_DATABASE_URL", "LOCAL_AGENT_TOKEN"}
     }
 
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -949,6 +1408,13 @@ if not LOCAL_AGENT_TOKEN:
         "do PC físico) não vai conseguir se autenticar até você configurar "
         "essa variável (aqui E no .env do agente_local.py, com o MESMO valor)."
     )
+if NEXUS_DATABASE_URL:
+    print("[INFO] NEXUS_DATABASE_URL configurada - integração federada com o Nexus ativa.")
+else:
+    print(
+        "[INFO] NEXUS_DATABASE_URL não definida - login federado e ferramentas "
+        "nexus_* ficam desativados (resto da Kyky funciona normalmente)."
+    )
 
 
 class RegisterRequest(BaseModel):
@@ -983,7 +1449,7 @@ def register(req: RegisterRequest):
 @app.post("/login", response_model=AuthResponse)
 def login(req: LoginRequest):
     username = req.username.strip()
-    role = verify_login(username, req.password)
+    role, _ = login_com_federacao_nexus(username, req.password)
     token = issue_token(username)
     return AuthResponse(token=token, username=username, role=role)
 
@@ -1028,6 +1494,7 @@ def chat(req: ChatRequest, user: dict = Depends(user_from_token)):
     cfg = load_config()
     session_id = req.session_id or str(uuid.uuid4())
     history = load_history(user["username"], session_id)
+    nexus_link = load_nexus_link(user["username"]) if NEXUS_DATABASE_URL else None
 
     text_content = req.message
     image_parts = []
@@ -1053,7 +1520,7 @@ def chat(req: ChatRequest, user: dict = Depends(user_from_token)):
         "attachments": [a.model_dump() for a in req.attachments],
     })
 
-    system_prompt = build_system_prompt(user, cfg)
+    system_prompt = build_system_prompt(user, cfg, nexus_link)
     groq_messages = [{"role": "system", "content": system_prompt}]
     recent_history = history[-MAX_HISTORY_MESSAGES_SENT:]
     for h in recent_history:
@@ -1062,7 +1529,7 @@ def chat(req: ChatRequest, user: dict = Depends(user_from_token)):
             content = ""
         groq_messages.append({"role": h["role"], "content": content})
 
-    tools = TOOLS_SCHEMA if user["role"] == "admin" else None
+    tools = tools_for_user(user, nexus_link)
 
     used_fallback = False
 
@@ -1104,7 +1571,7 @@ def chat(req: ChatRequest, user: dict = Depends(user_from_token)):
                         ),
                     })
                     continue
-                cfg, result_text = execute_tool_call(fn_name, fn_args, user, cfg)
+                cfg, result_text = execute_tool_call(fn_name, fn_args, user, cfg, nexus_link)
                 groq_messages.append({
                     "role": "tool",
                     "tool_call_id": call["id"],
@@ -1240,6 +1707,7 @@ def admin_delete_user(username: str, admin: dict = Depends(require_admin)):
         cur.execute("DELETE FROM tokens WHERE username = %s", (username,))
         cur.execute("DELETE FROM sessions WHERE username = %s", (username,))
         cur.execute("DELETE FROM memories WHERE username = %s", (username,))
+        cur.execute("DELETE FROM nexus_links WHERE username_kyky = %s", (username,))
     return {"status": "removido"}
 
 
@@ -1279,6 +1747,9 @@ def admin_stats(_: dict = Depends(require_admin)):
         cur.execute("SELECT COUNT(*) AS c FROM suggestions WHERE status = 'pendente'")
         pending_suggestions = cur.fetchone()["c"]
 
+        cur.execute("SELECT COUNT(*) AS c FROM nexus_links")
+        nexus_linked_users = cur.fetchone()["c"]
+
         return {
             "total_users": total_users,
             "total_sessions": total_sessions,
@@ -1287,6 +1758,7 @@ def admin_stats(_: dict = Depends(require_admin)):
             "active_7d": active_7d,
             "messages_by_day": by_day,
             "pending_suggestions": pending_suggestions,
+            "nexus_linked_users": nexus_linked_users,
         }
 
 
@@ -1445,6 +1917,18 @@ def admin_list_local_commands(_: dict = Depends(require_admin)):
         cur.execute(
             "SELECT id, username, action, argument, sensitive, status, result, created_at, completed_at "
             "FROM local_commands ORDER BY created_at DESC LIMIT 100"
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+@app.get("/admin/nexus/links")
+def admin_list_nexus_links(_: dict = Depends(require_admin)):
+    """Pro painel admin ver quem já está vinculado ao Nexus e com qual nível."""
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT username_kyky, nexus_usuario_id, nivel, grupo_nome, linked_at "
+            "FROM nexus_links ORDER BY linked_at DESC"
         )
         return [dict(r) for r in cur.fetchall()]
 
