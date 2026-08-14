@@ -123,6 +123,7 @@ import requests
 import psycopg2
 import psycopg2.extras
 from fastapi import FastAPI, HTTPException, Header, Depends, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -1391,6 +1392,17 @@ def shrink_image_for_groq(raw: bytes, content_type: str) -> tuple[bytes, str]:
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title=DEFAULT_AI_NAME)
+
+# Libera a API para ser chamada a partir de outra origem (ex: a Engine.html
+# rodando local ou hospedada em outro lugar). Em produção, troque "*" pela
+# origem exata da sua engine para maior segurança.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 if not GROQ_API_KEY:
     print(
